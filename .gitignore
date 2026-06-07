@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+*.egg-info/
+scrcpy-server-v4.0.jar
