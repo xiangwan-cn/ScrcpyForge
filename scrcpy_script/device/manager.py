@@ -44,13 +44,14 @@ class DeviceManager:
                 for line in lines
                 if "\tdevice" in line
             ]
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError) as e:
+            print(f"[DeviceManager] discover error: {e}")
             return []
 
     def connect_device(self, serial: str, **kwargs) -> Optional[DeviceSession]:
         if serial in self._connecting:
             return None
-        if serial in self._sessions and self._sessions[serial].connected:
+        if serial in self._sessions and self._sessions[serial].is_connected:
             return self._sessions[serial]
         self._connecting.add(serial)
 
@@ -92,16 +93,14 @@ class DeviceManager:
                 parts = line.split("\t")
                 if len(parts) == 2 and parts[0].strip() == serial:
                     return parts[1].strip() == "device"
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
             pass
         return False
 
     def _on_disconnect(self, serial: str) -> None:
-        print(f"[DeviceManager] _on_disconnect({serial})")
         self._sessions.pop(serial, None)
 
     def remove_session(self, serial: str) -> None:
-        print(f"[DeviceManager] remove_session({serial})")
         session = self._sessions.pop(serial, None)
         if session:
             session.disconnect()
@@ -143,8 +142,8 @@ class DeviceManager:
                     for serial in list(self._sessions):
                         if serial not in current and serial not in self._connecting:
                             self.remove_session(serial)
-                except Exception:
-                    pass
+                except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
+                    pass  # Transient failures, retry next poll cycle
                 time.sleep(self._poll_interval)
 
         self._poll_thread = threading.Thread(target=poll_loop, daemon=True)
@@ -166,6 +165,6 @@ class DeviceManager:
             for serial in serials:
                 if ip_addr in serial or ":" in serial:
                     return self.connect_device(serial) is not None
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError, FileNotFoundError):
             pass
         return False

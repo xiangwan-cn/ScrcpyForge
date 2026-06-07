@@ -19,6 +19,8 @@ from scrcpy_script.protocol.control import (
 from scrcpy_script.protocol.server import launch_server, ANNEX_B_PREFIX
 
 QUEUE_DEPTH = 2
+SWIPE_STEP_MS = 16
+MIN_SWIPE_STEPS = 2
 
 
 class DeviceSession:
@@ -175,7 +177,7 @@ class DeviceSession:
 
     def inject_swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int = 300) -> None:
         w, h = self._screen_size
-        steps = max(2, duration_ms // 16)
+        steps = max(MIN_SWIPE_STEPS, duration_ms // SWIPE_STEP_MS)
         for i in range(steps):
             t = i / (steps - 1)
             cx = int(x1 + (x2 - x1) * t)
@@ -238,7 +240,7 @@ class DeviceSession:
         return self._fps
 
     @property
-    def connected(self) -> bool:
+    def is_connected(self) -> bool:
         return self._connected
 
     def set_disconnect_callback(self, cb: Callable) -> None:

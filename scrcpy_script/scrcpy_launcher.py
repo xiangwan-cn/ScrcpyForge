@@ -37,7 +37,7 @@ class ScrcpyLauncher:
                 else:
                     os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
                 proc.wait(timeout=5)
-            except Exception:
+            except (subprocess.TimeoutExpired, ProcessLookupError, OSError):
                 proc.kill()
 
     def close_all(self) -> None:

@@ -9,7 +9,7 @@ class LogPanel:
         with dpg.child_window(tag=self._tag, label=label, height=-1):
             dpg.add_text(tag=self._log_tag, default_value="", wrap=0)
 
-    def refresh(self, session) -> None:
+    def refresh(self, session: "DeviceSession") -> None:
         if not dpg.does_item_exist(self._log_tag):
             return
         logs = session.logs()

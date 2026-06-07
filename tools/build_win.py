@@ -22,7 +22,7 @@ SPEC = PROJECT_ROOT / "tools" / "scrcpy_script.spec"
 MAIN = PROJECT_ROOT / "scrcpy_script" / "main.py"
 
 
-def clean():
+def clean() -> None:
     if WIN_DIR.exists():
         shutil.rmtree(WIN_DIR)
     for d in ["build", "dist"]:
@@ -34,7 +34,7 @@ def clean():
     print("[clean] Done")
 
 
-def build():
+def build() -> None:
     clean()
 
     cmd = [
@@ -69,7 +69,7 @@ def build():
     print(f"[build] Done → {output}")
 
 
-def copy_assets():
+def copy_assets() -> None:
     """Copy config and placeholder files alongside the exe."""
     output = WIN_DIR / "scrcpy_script"
     if not output.exists():
@@ -113,7 +113,7 @@ See README.md for full documentation.
     print(f"[assets] Config + scripts + templates copied to {output}")
 
 
-def main():
+def main() -> None:
     parser = argparse.ArgumentParser(description="Build ScrcpyScript for Windows")
     parser.add_argument("--clean", action="store_true", help="Clean only")
     args = parser.parse_args()

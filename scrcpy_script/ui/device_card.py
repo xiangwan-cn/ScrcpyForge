@@ -101,8 +101,8 @@ class DeviceCard:
                         spec.loader.exec_module(mod)
                         if hasattr(mod, "NAME"):
                             display = mod.NAME
-                except Exception:
-                    pass
+                except (ImportError, SyntaxError, AttributeError):
+                    pass  # Invalid manifest, skip
                 self._script_modules.append(display)
                 self._script_dirs[display] = d.name
 
@@ -164,7 +164,7 @@ class DeviceCard:
         preview_w = card_width - 40
         preview_h = card_height - 220  # space for title, buttons, log
 
-        status = f"Connected  {session.fps:.0f} FPS" if session.connected else "Disconnected"
+        status = f"Connected  {session.fps:.0f} FPS" if session.is_connected else "Disconnected"
         conn_type = "TCP" if ":" in serial else "USB"
         if dpg.does_item_exist(f"{tag}_status"):
             dpg.set_value(f"{tag}_status", f"{status} [{conn_type}]")
@@ -180,7 +180,7 @@ class DeviceCard:
         if frame is not None:
             self._render_frame(frame, serial, preview_w, preview_h)
 
-        if not session.connected and self._runner and self._runner.is_running:
+        if not session.is_connected and self._runner and self._runner.is_running:
             self._on_stop()
 
         if self._log_panel:

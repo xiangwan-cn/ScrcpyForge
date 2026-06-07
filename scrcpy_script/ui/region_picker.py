@@ -11,14 +11,14 @@ _picker_counter = 0
 _active_picker = None
 
 
-def new_picker(session, templates_dir="templates"):
+def new_picker(session: "DeviceSession", templates_dir: str = "templates") -> "RegionPicker":
     global _active_picker
     picker = RegionPicker(session, templates_dir)
     _active_picker = picker
     return picker
 
 
-def get_active_picker():
+def get_active_picker() -> "RegionPicker | None":
     return _active_picker
 
 
