@@ -65,9 +65,7 @@ class DeviceCard:
 
             dpg.add_combo(
                 items=self._script_modules, tag=f"{tag}_script",
-                default_value="test_tap" if "test_tap" in self._script_modules else (
-                    self._script_modules[0] if self._script_modules else ""
-                ),
+                default_value="",
                 label="Script", width=150,
             )
             with dpg.group(horizontal=True):
