@@ -62,7 +62,15 @@ class UiApp:
 
         for serial in list(self._cards.keys()):
             if serial not in {s.serial() for s in sessions}:
-                self._cards.pop(serial, None)
+                card = self._cards.pop(serial, None)
+                if card:
+                    card.shutdown()
+                    tag = f"card_{serial}"
+                    if dpg.does_item_exist(tag):
+                        dpg.delete_item(tag)
+                    tex_reg = f"card_{serial}_tex_reg"
+                    if dpg.does_item_exist(tex_reg):
+                        dpg.delete_item(tex_reg)
 
         vp_w = dpg.get_viewport_width()
         vp_h = dpg.get_viewport_height()
