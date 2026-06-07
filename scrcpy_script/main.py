@@ -39,8 +39,11 @@ def main() -> None:
     config_path = Path(args.config)
     if config_path.exists():
         config.load(str(config_path))
-    elif (root / args.config).exists():
-        config.load(str(root / args.config))
+    else:
+        for base in [root, root / "scrcpy_script"]:
+            if (base / args.config).exists():
+                config.load(str(base / args.config))
+                break
 
     jar_path = args.jar
     if not jar_path:

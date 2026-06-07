@@ -36,3 +36,4 @@ def script(api):
             api.wait(120)
         else:
             api.wait(20)
+            api.log(f"No match {elapsed:.1f}ms")
