@@ -1,4 +1,4 @@
-# ScrcpyScript
+# ScrcpyForge
 
 Multi-device Android automation — Python edition. Control one or more Android devices via scrcpy v4.0 protocol, run automation scripts with OpenCV template matching, all from a DearPyGui desktop UI.
 

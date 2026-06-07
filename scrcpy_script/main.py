@@ -1,4 +1,4 @@
-"""ScrcpyScript — multi-device Android automation with Python."""
+"""ScrcpyForge — multi-device Android automation with Python."""
 import argparse
 import sys
 from pathlib import Path
@@ -28,7 +28,7 @@ def _resolve_root() -> Path:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ScrcpyScript")
+    parser = argparse.ArgumentParser(description="ScrcpyForge")
     parser.add_argument("--config", default="scrcpy_config.conf",
                         help="Path to config file")
     parser.add_argument("--device", help="Serial of device to connect on startup")

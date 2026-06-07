@@ -1,4 +1,4 @@
-# ScrcpyScript
+# ScrcpyForge
 
 多设备 Android 自动化 — Python 版。通过 scrcpy v4.0 协议控制一台或多台 Android 设备，使用 OpenCV 模板匹配编写自动化脚本，基于 DearPyGui 桌面界面。
 

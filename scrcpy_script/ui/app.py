@@ -20,11 +20,10 @@ class UiApp:
         self._manager = device_manager
         self._scripts_dir = scripts_dir
         dpg.create_context()
-        dpg.create_viewport(title="ScrcpyScript", width=1400, height=900)
-        dpg.set_global_font_scale(0.85)
+        dpg.create_viewport(title="ScrcpyForge", width=1400, height=900)
         dpg.setup_dearpygui()
 
-        with dpg.window(tag="main_window", label="ScrcpyScript",
+        with dpg.window(tag="main_window", label="ScrcpyForge",
                         no_title_bar=False):
             with dpg.group(horizontal=True):
                 dpg.add_button(label="Scan", callback=self._on_scan)

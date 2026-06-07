@@ -93,7 +93,7 @@ def copy_assets() -> None:
                     shutil.copytree(d, dest)
 
     # Create README
-    (output / "README.txt").write_text("""ScrcpyScript — Multi-device Android Automation
+    (output / "README.txt").write_text("""ScrcpyForge — Multi-device Android Automation
 =============================================
 
 Quick Start:
@@ -114,7 +114,7 @@ See README.md for full documentation.
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build ScrcpyScript for Windows")
+    parser = argparse.ArgumentParser(description="Build ScrcpyForge for Windows")
     parser.add_argument("--clean", action="store_true", help="Clean only")
     args = parser.parse_args()
 
