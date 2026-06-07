@@ -139,6 +139,8 @@ class DeviceSession:
             self.log(f"[ERROR] Decode error: {e}")
         finally:
             self._connected = False
+            if self._disconnect_cb:
+                self._disconnect_cb(self._serial)
 
     def _update_fps(self) -> None:
         now = time.monotonic()

@@ -2,7 +2,6 @@
 
 多设备 Android 自动化 — Python 版。通过 scrcpy v4.0 协议控制一台或多台 Android 设备，使用 OpenCV 模板匹配编写自动化脚本，基于 DearPyGui 桌面界面。
 
-零 C++ 依赖。纯 Python 胶水层调用 C 扩展（PyAV、OpenCV、numpy）。
 
 ## 快速开始
 
@@ -64,7 +63,7 @@ tools/
 └── build_win.py             # Windows .exe 打包脚本
 ```
 
-17 个 Python 文件，约 1800 行。C++ 版原始 5508 行（减少 67%）。
+17 个 Python 文件，约 1800 行。
 
 ## 架构
 
