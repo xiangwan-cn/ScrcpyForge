@@ -23,8 +23,8 @@ def script(api):
         elapsed = (time.perf_counter() - t0) * 1000
 
         if match:
-            ox = random.randint(-5, 5)
-            oy = random.randint(-5, 5)
+            ox = random.randint(-2, 2)
+            oy = random.randint(-2, 2)
             tx, ty = match["x"] + ox, match["y"] + oy
             api.tap(tx, ty)
             api.log(
@@ -33,6 +33,6 @@ def script(api):
                 f"{elapsed:.1f}ms "
                 f"→ tapped ({tx},{ty})"
             )
-            api.wait(150)
+            api.wait(120)
         else:
-            api.wait(200)
+            api.wait(20)
