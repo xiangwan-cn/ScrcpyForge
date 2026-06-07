@@ -147,6 +147,33 @@ Implements scrcpy v4.0 wire protocol directly:
 
 All integers big-endian, matching scrcpy v4.0 spec.
 
+## Packaging for Windows
+
+Build a standalone `.exe` with all dependencies bundled:
+
+```bash
+# On Windows (or cross-build with CI):
+python tools/build_win.py
+```
+
+Output structure in `win/scrcpy_script/`:
+
+```
+win/scrcpy_script/
+├── scrcpy_script.exe         # Standalone executable
+├── scrcpy_config.conf        # Default config (edit as needed)
+├── scrcpy-server-v4.0.jar   # Place here before running
+├── scripts/                  # Your automation scripts
+│   └── match_tap/
+│       ├── manifest.py
+│       └── script.py
+└── templates/                # Template images for matching
+```
+
+Distribute the entire `win/scrcpy_script/` folder. Users need ADB and scrcpy in PATH.
+
+For automated CI builds (GitHub Actions), see `tools/build_win.py`.
+
 ## Dependencies
 
 ```

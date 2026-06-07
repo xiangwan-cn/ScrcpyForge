@@ -3,11 +3,14 @@ import argparse
 import sys
 from pathlib import Path
 
-# Allow running as both `python scrcpy_script/main.py` and `python -m scrcpy_script.main`
-_script_dir = Path(__file__).resolve().parent
-_project_root = _script_dir.parent
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
+if getattr(sys, "frozen", False):
+    _exe_dir = Path(sys.executable).parent
+    sys.path.insert(0, str(_exe_dir))
+else:
+    _script_dir = Path(__file__).resolve().parent
+    _project_root = _script_dir.parent
+    if str(_project_root) not in sys.path:
+        sys.path.insert(0, str(_project_root))
 
 from scrcpy_script.config import Config
 from scrcpy_script.device.manager import DeviceManager
@@ -15,12 +18,13 @@ from scrcpy_script.ui.app import UiApp
 
 
 def _resolve_root() -> Path:
-    """Find project root (containing scrcpy_config.conf or scrcpy-server jar)."""
-    cwd = Path.cwd()
-    for base in [cwd, cwd.parent, cwd.parent.parent]:
+    """Find project root (config/scripts/jar)."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    for base in [Path.cwd(), _project_root]:
         if (base / "scrcpy_config.conf").exists() or (base / "scrcpy_script" / "scrcpy_config.conf").exists():
             return base
-    return cwd
+    return Path.cwd()
 
 
 def main() -> None:
