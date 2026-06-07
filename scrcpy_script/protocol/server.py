@@ -190,7 +190,7 @@ def launch_server(
     # Read dummy byte
     video_sock.settimeout(3.0)
     try:
-        _ = video_sock.recv(1)
+        dummy = video_sock.recv(1)
         if len(dummy) != 1:
             video_sock.close()
             return None, "Dummy byte read failed"
