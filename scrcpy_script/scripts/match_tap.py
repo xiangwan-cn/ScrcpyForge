@@ -1,9 +1,10 @@
 """Template match and click with random 5px offset."""
 import random
+import time
 
 
 # TODO: replace with your template image path
-TEMPLATE = "templates/your_template.png"
+TEMPLATE = "templates/template.png"
 # TODO: adjust threshold if needed (0.0–1.0, higher = stricter)
 THRESHOLD = 0.8
 
@@ -12,7 +13,10 @@ def script(api):
     api.log(f"Matching: {TEMPLATE} (threshold={THRESHOLD})")
 
     while True:
+        t0 = time.perf_counter()
         match = api.find(TEMPLATE, threshold=THRESHOLD)
+        elapsed = (time.perf_counter() - t0) * 1000
+
         if match:
             ox = random.randint(-5, 5)
             oy = random.randint(-5, 5)
@@ -21,6 +25,7 @@ def script(api):
             api.log(
                 f"Match at ({match['x']},{match['y']}) "
                 f"conf={match['confidence']:.2f} "
+                f"time={elapsed:.1f}ms "
                 f"→ tapped ({tx},{ty})"
             )
             api.wait(1500)
