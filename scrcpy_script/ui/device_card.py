@@ -84,20 +84,37 @@ class DeviceCard:
 
     def _refresh_scripts(self) -> None:
         self._script_modules = []
+        self._script_dirs: dict[str, str] = {}
         scripts_path = Path(self._scripts_dir)
         if scripts_path.is_dir():
             for d in sorted(scripts_path.glob("*")):
                 if not d.is_dir() or d.name.startswith("_"):
                     continue
-                if (d / "manifest.py").is_file():
-                    self._script_modules.append(d.name)
+                manifest = d / "manifest.py"
+                if not manifest.is_file():
+                    continue
+                display = d.name
+                try:
+                    spec = importlib.util.spec_from_file_location(
+                        f"_{d.name}_manifest", str(manifest),
+                    )
+                    if spec and spec.loader:
+                        mod = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(mod)
+                        if hasattr(mod, "NAME"):
+                            display = mod.NAME
+                except Exception:
+                    pass
+                self._script_modules.append(display)
+                self._script_dirs[display] = d.name
 
     def _load_script(self, name: str) -> Optional[ModuleType]:
         scripts_path = Path(self._scripts_dir)
-        manifest = scripts_path / name / "manifest.py"
+        dir_name = self._script_dirs.get(name, name)
+        manifest = scripts_path / dir_name / "manifest.py"
         if manifest.exists():
             spec = importlib.util.spec_from_file_location(
-                f"{name}.manifest", str(manifest),
+                f"{dir_name}.manifest", str(manifest),
             )
             if spec is None or spec.loader is None:
                 return None

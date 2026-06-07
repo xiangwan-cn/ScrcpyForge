@@ -1,4 +1,6 @@
 """Script manifest — must export script(api)."""
+NAME = "模板匹配点击"  # UI 显示名称
+
 from importlib.machinery import SourceFileLoader
 from pathlib import Path
 
