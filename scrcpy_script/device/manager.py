@@ -97,9 +97,11 @@ class DeviceManager:
         return False
 
     def _on_disconnect(self, serial: str) -> None:
+        print(f"[DeviceManager] _on_disconnect({serial})")
         self._sessions.pop(serial, None)
 
     def remove_session(self, serial: str) -> None:
+        print(f"[DeviceManager] remove_session({serial})")
         session = self._sessions.pop(serial, None)
         if session:
             session.disconnect()
