@@ -126,6 +126,7 @@ class DeviceManager:
                     current = set(self.discover())
                     now = time.monotonic()
 
+                    # Auto-connect newly discovered devices
                     for serial in current:
                         if serial in self._connecting:
                             continue
@@ -135,6 +136,11 @@ class DeviceManager:
                             if now - self._failed_serials[serial] >= self._reconnect_cooldown:
                                 del self._failed_serials[serial]
                                 self.connect_device(serial, **self._connect_params)
+
+                    # Disconnect devices that disappeared from adb
+                    for serial in list(self._sessions):
+                        if serial not in current and serial not in self._connecting:
+                            self.remove_session(serial)
                 except Exception:
                     pass
                 time.sleep(self._poll_interval)
