@@ -86,34 +86,25 @@ class DeviceCard:
         self._script_modules = []
         scripts_path = Path(self._scripts_dir)
         if scripts_path.is_dir():
-            # Subdir-based scripts: <name>/script.py
             for d in sorted(scripts_path.glob("*")):
                 if not d.is_dir() or d.name.startswith("_"):
                     continue
-                if (d / "script.py").is_file():
+                if (d / "manifest.py").is_file():
                     self._script_modules.append(d.name)
 
     def _load_script(self, name: str) -> Optional[ModuleType]:
         scripts_path = Path(self._scripts_dir)
-
-        # Try subdir/script.py first (registration pattern)
-        subdir_path = scripts_path / name / "script.py"
-        if subdir_path.exists():
-            path = subdir_path
-            module_name = f"{name}.script"
-        else:
-            # Fallback: flat .py file
-            path = scripts_path / f"{name}.py"
-            module_name = name
-
-        if not path.exists():
-            return None
-        spec = importlib.util.spec_from_file_location(module_name, str(path))
-        if spec is None or spec.loader is None:
-            return None
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
+        manifest = scripts_path / name / "manifest.py"
+        if manifest.exists():
+            spec = importlib.util.spec_from_file_location(
+                f"{name}.manifest", str(manifest),
+            )
+            if spec is None or spec.loader is None:
+                return None
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        return None
 
     def _on_run(self) -> None:
         if self._runner and self._runner.is_running:
