@@ -113,7 +113,7 @@ class DeviceSession:
 
                 if pkt_info.get("is_config"):
                     try:
-                        packets = codec.parse(ANNEX_B_PREFIX + data)
+                        packets = codec.parse(data)
                         for pkt in packets:
                             codec.decode(pkt)
                     except Exception:
@@ -121,7 +121,7 @@ class DeviceSession:
                     continue
 
                 try:
-                    packets = codec.parse(ANNEX_B_PREFIX + data)
+                    packets = codec.parse(data)
                     for pkt in packets:
                         frames = codec.decode(pkt)
                         for frame in frames:
