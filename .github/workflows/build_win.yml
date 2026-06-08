@@ -5,6 +5,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
@@ -21,15 +24,7 @@ jobs:
         run: pip install -r requirements.txt pyinstaller
 
       - name: Build .exe
-        run: |
-          pyinstaller --onefile --clean --noconfirm `
-            --name scrcpy_forge `
-            --hidden-import av --hidden-import av.codec --hidden-import av.container `
-            --hidden-import av.stream --hidden-import av.packet --hidden-import av.format `
-            --hidden-import cv2 --hidden-import numpy --hidden-import numpy.core._methods `
-            --hidden-import dearpygui --hidden-import dearpygui._dearpygui `
-            --hidden-import watchdog --hidden-import watchdog.observers --hidden-import watchdog.events `
-            scrcpy_script/main.py
+        run: pyinstaller --clean --noconfirm tools/scrcpy_forge.spec
 
       - name: Prepare release package
         run: |
