@@ -114,18 +114,16 @@ class DeviceSession:
 
                 if pkt_info.get("is_config"):
                     try:
-                        packets = codec.parse(ANNEX_B_PREFIX + data)
-                        for pkt in packets:
-                            codec.decode(pkt)
-                    except Exception as e:
-                        self.log(f"[WARN] Config parse error: {e}")
+                        pkt = av.Packet(ANNEX_B_PREFIX + data)
+                        codec.decode(pkt)
+                    except Exception:
+                        pass
                     continue
 
                 try:
-                    packets = codec.parse(ANNEX_B_PREFIX + data)
-                    for pkt in packets:
-                        frames = codec.decode(pkt)
-                        for frame in frames:
+                    pkt = av.Packet(ANNEX_B_PREFIX + data)
+                    frames = codec.decode(pkt)
+                    for frame in frames:
                             img = frame.to_ndarray(format="bgr24")
                             self._cached_frame = img
                             try:
