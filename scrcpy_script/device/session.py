@@ -116,8 +116,12 @@ class DeviceSession:
                         packets = codec.parse(data)
                         for pkt in packets:
                             codec.decode(pkt)
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        if not getattr(self, "_decode_err", False):
+                            self._decode_err = True
+                            import traceback
+                            self.log(f"[ERROR] Decode: {e}")
+                            traceback.print_exc()
                     continue
 
                 try:
