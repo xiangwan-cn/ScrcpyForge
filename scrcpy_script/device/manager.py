@@ -22,6 +22,9 @@ class DeviceManager:
         self._next_port = port_start
         self._connect_params: dict = {}
         self._connecting: set[str] = set()
+        self._encoder_idx: dict[str, int] = {}
+
+        self._FALLBACK_ENCODERS = ["", "c2.android.avc.encoder", "OMX.google.h264.encoder"]
 
     def _alloc_ports(self) -> tuple[int, int]:
         video = self._next_port
@@ -62,7 +65,13 @@ class DeviceManager:
         params.setdefault("max_fps", 60)
         params.setdefault("bit_rate", 8000000)
         params.setdefault("video_codec", "h264")
+        params.setdefault("video_encoder", "")
         params.setdefault("jar_path", "scrcpy-server-v4.0.jar")
+
+        # Apply per-serial encoder fallback
+        idx = self._encoder_idx.get(serial, 0)
+        if idx < len(self._FALLBACK_ENCODERS):
+            params["video_encoder"] = self._FALLBACK_ENCODERS[idx]
 
         with self._lock:
             if serial in self._sessions:
@@ -77,6 +86,7 @@ class DeviceManager:
             video_port=video_port, control_port=control_port,
             max_size=params["max_size"], max_fps=params["max_fps"],
             bit_rate=params["bit_rate"], video_codec=params["video_codec"],
+            video_encoder=params["video_encoder"],
             jar_path=params["jar_path"],
         ):
             self._failed_serials[serial] = time.monotonic()
@@ -104,6 +114,10 @@ class DeviceManager:
     def _on_disconnect(self, serial: str) -> None:
         with self._lock:
             self._sessions.pop(serial, None)
+        idx = self._encoder_idx.get(serial, 0)
+        if idx + 1 < len(self._FALLBACK_ENCODERS):
+            self._encoder_idx[serial] = idx + 1
+            print(f"[fallback] {serial} switching to encoder #{idx + 1}: {self._FALLBACK_ENCODERS[idx + 1] or 'default'}")
 
     def remove_session(self, serial: str) -> None:
         with self._lock:

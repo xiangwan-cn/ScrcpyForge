@@ -21,6 +21,7 @@ from scrcpy_script.protocol.server import launch_server, ANNEX_B_PREFIX
 QUEUE_DEPTH = 2
 SWIPE_STEP_MS = 16
 MIN_SWIPE_STEPS = 2
+FALLBACK_TIMEOUT = 5.0  # seconds without frame → switch encoder
 
 
 class DeviceSession:
@@ -50,6 +51,7 @@ class DeviceSession:
         max_fps: int = 60,
         bit_rate: int = 8000000,
         video_codec: str = "h264",
+        video_encoder: str = "",
         jar_path: str = "scrcpy-server-v4.0.jar",
     ) -> bool:
         session, error = launch_server(
@@ -57,6 +59,7 @@ class DeviceSession:
             jar_path=jar_path, max_size=max_size,
             max_fps=max_fps, bit_rate=bit_rate,
             video_codec=video_codec,
+            video_encoder=video_encoder,
         )
         if session is None:
             err = f"[ERROR] connect failed: {error}"
@@ -90,8 +93,17 @@ class DeviceSession:
 
     def _decode_loop(self) -> None:
         codec = av.CodecContext.create("h264", "r")
+        has_frame = False
+        first_pkt_at = time.monotonic()
         try:
             while not self._stop_decode and self._session is not None:
+                if not has_frame and time.monotonic() - first_pkt_at > FALLBACK_TIMEOUT:
+                    self.log("[WARN] No frames — requesting encoder fallback")
+                    self._connected = False
+                    if self._disconnect_cb:
+                        self._disconnect_cb(self._serial)
+                    return
+
                 pkt_info = self._session.read_packet()
                 if pkt_info is None:
 
@@ -141,6 +153,7 @@ class DeviceSession:
                                     except queue.Empty:
                                         pass
                                 self._update_fps()
+                                has_frame = True
                         except Exception:
                             pass
                 except Exception:

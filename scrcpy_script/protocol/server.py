@@ -117,11 +117,13 @@ def launch_server(
     bit_rate: int = 8000000,
     max_fps: int = 60,
     video_codec: str = "h264",
+    video_encoder: str = "",
     stay_awake: bool = True,
 ) -> tuple[Optional[ScrcpySession], Optional[str]]:
     try:
         return _launch_server(serial, video_port, control_port, jar_path,
-                               max_size, bit_rate, max_fps, video_codec, stay_awake)
+                               max_size, bit_rate, max_fps, video_codec,
+                               video_encoder, stay_awake)
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -137,6 +139,7 @@ def _launch_server(
     bit_rate: int = 8000000,
     max_fps: int = 60,
     video_codec: str = "h264",
+    video_encoder: str = "",
     stay_awake: bool = True,
 ) -> tuple[Optional[ScrcpySession], Optional[str]]:
     # Kill stale servers
@@ -175,6 +178,8 @@ def _launch_server(
         f"max_size={max_size} "
         f"video_codec={video_codec}"
     )
+    if video_encoder:
+        cmd += f" video_encoder={video_encoder}"
     if bit_rate > 0:
         cmd += f" video_bit_rate={bit_rate}"
     if max_fps > 0:

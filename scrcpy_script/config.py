@@ -56,6 +56,10 @@ class Config:
         return self.get("video_codec", "h264")
 
     @property
+    def video_encoder(self) -> str:
+        return self.get("video_encoder", "")
+
+    @property
     def max_size(self) -> int:
         return self.get_int("max_size", 1280)
 

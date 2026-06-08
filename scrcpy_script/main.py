@@ -77,6 +77,7 @@ def main() -> None:
         max_fps=config.max_fps,
         bit_rate=config.bit_rate,
         video_codec=config.video_codec,
+        video_encoder=config.video_encoder,
     )
     manager.start_polling()
 
