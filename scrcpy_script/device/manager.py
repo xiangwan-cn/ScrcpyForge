@@ -82,6 +82,7 @@ class DeviceManager:
         session.set_disconnect_callback(self._on_disconnect)
         self._sessions[serial] = session
         self._connecting.discard(serial)
+        print(f"[DM] session added: {serial} total={len(self._sessions)}", flush=True)
         return session
 
     def _is_device_authorized(self, serial: str) -> bool:
@@ -113,7 +114,9 @@ class DeviceManager:
         return self._sessions.get(serial)
 
     def get_sessions(self) -> list[DeviceSession]:
-        return list(self._sessions.values())
+        result = list(self._sessions.values())
+        print(f"[DM] get_sessions() → {[s.serial() for s in result]}", flush=True)
+        return result
 
     def session_count(self) -> int:
         return len(self._sessions)
