@@ -136,8 +136,8 @@ class DeviceSession:
                                 except queue.Empty:
                                     pass
                             self._update_fps()
-                except Exception as e:
-                    self.log(f"[WARN] Decode drop: {e}")
+                except Exception:
+                    pass
         except Exception as e:
             self.log(f"[ERROR] Decode error: {e}")
         finally:
