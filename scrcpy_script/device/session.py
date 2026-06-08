@@ -113,7 +113,6 @@ class DeviceSession:
 
                 if pkt_info.get("is_config"):
                     try:
-                        codec.extradata = data
                         packets = codec.parse(ANNEX_B_PREFIX + data)
                         for pkt in packets:
                             codec.decode(pkt)
