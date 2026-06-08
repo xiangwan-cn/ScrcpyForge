@@ -58,7 +58,6 @@ class UiApp:
         if not self._manager:
             return
         sessions = self._manager.get_sessions()
-        print(f"[UI] sessions={len(sessions)} cards={len(self._cards)}", flush=True)
 
         for serial in list(self._cards.keys()):
             if serial not in {s.serial() for s in sessions}:
