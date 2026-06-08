@@ -130,6 +130,19 @@ class DeviceSession:
                     for pkt in packets:
                         frames = codec.decode(pkt)
                         for frame in frames:
+                            img = frame.to_ndarray(format="bgr24")
+                            self._cached_frame = img
+                            try:
+                                self._frame_queue.put_nowait(img)
+                            except queue.Full:
+                                try:
+                                    self._frame_queue.get_nowait()
+                                    self._frame_queue.put_nowait(img)
+                                except queue.Empty:
+                                    pass
+                            self._update_fps()
+                except Exception:
+                    pass
         except Exception as e:
             self.log(f"[ERROR] Decode error: {e}")
         finally:
