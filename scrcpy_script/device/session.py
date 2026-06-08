@@ -61,7 +61,9 @@ class DeviceSession:
         if session is None:
             err = f"[ERROR] connect failed: {error}"
             self.log(err)
+            print(f"[SESSION.connect] FAILED: {error}", flush=True)
             return False
+        print(f"[SESSION.connect] SUCCESS", flush=True)
         self._session = session
         self._device_name = session.device_name or self._serial
         self._connected = True
