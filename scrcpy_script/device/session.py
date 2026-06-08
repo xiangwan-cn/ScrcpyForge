@@ -113,23 +113,18 @@ class DeviceSession:
 
                 if pkt_info.get("is_config"):
                     try:
+                        codec.extradata = data
                         packets = codec.parse(ANNEX_B_PREFIX + data)
                         for pkt in packets:
                             codec.decode(pkt)
-                    except Exception as e:
-                        if not getattr(self, "_decode_err", False):
-                            self._decode_err = True
-                            import traceback
-                            self.log(f"[ERROR] Decode: {e}")
-                            traceback.print_exc()
+                    except Exception:
+                        pass
                     continue
 
                 try:
-                    pkt = av.Packet(ANNEX_B_PREFIX + data)
-                    frames = codec.decode(pkt)
-                    if getattr(self, "_frame_first", True) and frames:
-                        self._frame_first = False
-                        self.log(f"[DEBUG] decode: {len(frames)} frames")
+                    packets = codec.parse(ANNEX_B_PREFIX + data)
+                    for pkt in packets:
+                        frames = codec.decode(pkt)
                         for frame in frames:
                             img = frame.to_ndarray(format="bgr24")
                             self._cached_frame = img
