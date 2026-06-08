@@ -1,0 +1,47 @@
+name: Build Windows
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build .exe
+        run: |
+          pyinstaller --onefile --clean --noconfirm `
+            --name scrcpy_forge `
+            --hidden-import av --hidden-import av.codec --hidden-import av.container `
+            --hidden-import av.stream --hidden-import av.packet --hidden-import av.format `
+            --hidden-import cv2 --hidden-import numpy --hidden-import numpy.core._methods `
+            --hidden-import dearpygui --hidden-import dearpygui._dearpygui `
+            --hidden-import watchdog --hidden-import watchdog.observers --hidden-import watchdog.events `
+            scrcpy_script/main.py
+
+      - name: Prepare release package
+        run: |
+          mkdir ScrcpyForge
+          copy dist\scrcpy_forge.exe ScrcpyForge\
+          copy scrcpy_script\scrcpy_config.conf ScrcpyForge\
+          mkdir ScrcpyForge\scripts
+          mkdir ScrcpyForge\templates
+          xcopy /E /I scrcpy_script\scripts ScrcpyForge\scripts
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ScrcpyForge
+          path: ScrcpyForge/

@@ -149,30 +149,23 @@ All integers big-endian, matching scrcpy v4.0 spec.
 
 ## Packaging for Windows
 
-Build a standalone `.exe` with all dependencies bundled:
+Download the latest `ScrcpyForge.zip` from [Releases](https://github.com/xiangwan-cn/ScrcpyForge/releases).
 
+**To use:**
+1. Unzip — you get `scrcpy_forge.exe`, `scrcpy_config.conf`, `scripts/`, `templates/`
+2. Place `scrcpy-server-v4.0.jar` in the same directory (download from [scrcpy releases](https://github.com/Genymobile/scrcpy/releases/tag/v4.0))
+3. Install ADB and add to PATH
+4. Connect an Android device via USB (debugging enabled)
+5. Run `scrcpy_forge.exe`
+
+**To build from source:**
 ```bash
-# On Windows (or cross-build with CI):
+pip install pyinstaller
 python tools/build_win.py
+# Output in win/scrcpy_script/
 ```
 
-Output structure in `win/scrcpy_script/`:
-
-```
-win/scrcpy_script/
-├── scrcpy_script.exe         # Standalone executable
-├── scrcpy_config.conf        # Default config (edit as needed)
-├── scrcpy-server-v4.0.jar   # Place here before running
-├── scripts/                  # Your automation scripts
-│   └── match_tap/
-│       ├── manifest.py
-│       └── script.py
-└── templates/                # Template images for matching
-```
-
-Distribute the entire `win/scrcpy_script/` folder. Users need ADB and scrcpy in PATH.
-
-For automated CI builds (GitHub Actions), see `tools/build_win.py`.
+**CI builds** run on every version tag (`v*`) via GitHub Actions. See `.github/workflows/build_win.yml`.
 
 ## Dependencies
 
