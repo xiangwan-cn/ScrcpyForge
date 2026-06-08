@@ -113,7 +113,7 @@ class DeviceSession:
 
                 if pkt_info.get("is_config"):
                     try:
-                        packets = codec.parse(ANNEX_B_PREFIX + data)
+                        packets = codec.parse(data)
                         for pkt in packets:
                             codec.decode(pkt)
                     except Exception:
@@ -126,7 +126,7 @@ class DeviceSession:
                         self._fmt_check = True
                         self.log(f"[FMT] first 8 bytes: {data[:8].hex()} len={len(data)}")
 
-                    packets = codec.parse(ANNEX_B_PREFIX + data)
+                    packets = codec.parse(data)
                     for pkt in packets:
                         frames = codec.decode(pkt)
                         for frame in frames:
