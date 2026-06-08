@@ -24,7 +24,7 @@ jobs:
         run: pip install -r requirements.txt pyinstaller
 
       - name: Build .exe
-        run: pyinstaller --clean --noconfirm tools/scrcpy_forge.spec
+        run: pyinstaller --clean --noconfirm scrcpy_forge.spec
 
       - name: Prepare release package
         run: |
