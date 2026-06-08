@@ -60,7 +60,6 @@ class DeviceSession:
         )
         if session is None:
             err = f"[ERROR] connect failed: {error}"
-            print(err, flush=True)
             self.log(err)
             return False
         self._session = session
@@ -114,16 +113,18 @@ class DeviceSession:
 
                 if pkt_info.get("is_config"):
                     try:
-                        pkt = av.Packet(ANNEX_B_PREFIX + data)
-                        codec.decode(pkt)
+                        packets = codec.parse(ANNEX_B_PREFIX + data)
+                        for pkt in packets:
+                            codec.decode(pkt)
                     except Exception:
                         pass
                     continue
 
                 try:
-                    pkt = av.Packet(ANNEX_B_PREFIX + data)
-                    frames = codec.decode(pkt)
-                    for frame in frames:
+                    packets = codec.parse(ANNEX_B_PREFIX + data)
+                    for pkt in packets:
+                        frames = codec.decode(pkt)
+                        for frame in frames:
                             img = frame.to_ndarray(format="bgr24")
                             self._cached_frame = img
                             try:
@@ -136,9 +137,7 @@ class DeviceSession:
                                     pass
                             self._update_fps()
                 except Exception as e:
-                    if not getattr(self, "_decode_drop_cnt", 0):
-                        self.log(f"[WARN] Decode drop: {e} (further drops suppressed)")
-                    self._decode_drop_cnt = getattr(self, "_decode_drop_cnt", 0) + 1
+                    self.log(f"[WARN] Decode drop: {e}")
         except Exception as e:
             self.log(f"[ERROR] Decode error: {e}")
         finally:
