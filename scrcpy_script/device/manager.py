@@ -2,7 +2,7 @@
 import subprocess
 import threading
 import time
-from typing import Callable, Optional
+from typing import Optional
 
 from scrcpy_script.device.session import DeviceSession
 
@@ -117,7 +117,6 @@ class DeviceManager:
         idx = self._encoder_idx.get(serial, 0)
         if idx + 1 < len(self._FALLBACK_ENCODERS):
             self._encoder_idx[serial] = idx + 1
-            print(f"[fallback] {serial} switching to encoder #{idx + 1}: {self._FALLBACK_ENCODERS[idx + 1] or 'default'}")
 
     def remove_session(self, serial: str) -> None:
         with self._lock:

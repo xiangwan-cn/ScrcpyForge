@@ -34,7 +34,6 @@ def main() -> None:
     parser.add_argument("--device", help="Serial of device to connect on startup")
     parser.add_argument("--script", help="Script to load on startup")
     parser.add_argument("--jar", help="Path to scrcpy-server-v4.0.jar")
-    parser.add_argument("--adb", help="Path to adb binary (unused, uses system adb)")
     args = parser.parse_args()
 
     root = _resolve_root()

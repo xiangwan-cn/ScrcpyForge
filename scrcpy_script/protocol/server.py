@@ -120,14 +120,9 @@ def launch_server(
     video_encoder: str = "",
     stay_awake: bool = True,
 ) -> tuple[Optional[ScrcpySession], Optional[str]]:
-    try:
-        return _launch_server(serial, video_port, control_port, jar_path,
-                               max_size, bit_rate, max_fps, video_codec,
-                               video_encoder, stay_awake)
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return None, str(e)
+    return _launch_server(serial, video_port, control_port, jar_path,
+                           max_size, bit_rate, max_fps, video_codec,
+                           video_encoder, stay_awake)
 
 
 def _launch_server(
@@ -142,11 +137,14 @@ def _launch_server(
     video_encoder: str = "",
     stay_awake: bool = True,
 ) -> tuple[Optional[ScrcpySession], Optional[str]]:
-    # Kill stale servers
-    subprocess.run(
-        f"adb -s {serial} shell 'pkill -9 -f app_process.*scrcpy' 2>/dev/null",
-        shell=True, capture_output=True,
-    )
+    # Kill stale servers (best-effort, may fail on Windows)
+    try:
+        subprocess.run(
+            f"adb -s {serial} shell pkill -9 -f app_process.*scrcpy",
+            shell=True, capture_output=True, timeout=5,
+        )
+    except Exception:
+        pass
     time.sleep(0.5)
 
     # Push jar
@@ -186,7 +184,6 @@ def _launch_server(
         cmd += f" max_fps={max_fps}"
     if stay_awake:
         cmd += " stay_awake=true"
-    cmd += " 2>&1 &"
     subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2.0)
 
@@ -209,8 +206,7 @@ def _launch_server(
                 video_sock.connect(("127.0.0.1", video_port))
                 connected = True
                 break
-            except OSError as e:
-                print(f"[launch] video connect retry: {e}", flush=True)
+            except OSError:
                 try:
                     video_sock.close()
                 except OSError:
@@ -218,8 +214,7 @@ def _launch_server(
                 time.sleep(0.1)
         if not connected:
             return None, "Video socket connect timeout"
-    except Exception as e:
-        print(f"[launch] VIDEO SOCKET SETUP ERROR: {type(e).__name__} {e}", flush=True)
+    except Exception:
         return None, "Video socket error"
 
     # Read dummy byte
@@ -293,6 +288,4 @@ def _launch_server(
 
     session._video_sock = video_sock
     session._control_sock = control_sock
-
-    print(f"[{serial}] Device: {session.device_name}")
     return session, None

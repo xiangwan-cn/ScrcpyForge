@@ -76,4 +76,3 @@ def build_back_or_screen_on(action: int) -> bytes:
 
 
 BACK_ACTION = 0
-SCREEN_ON_ACTION = 1
