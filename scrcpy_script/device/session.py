@@ -60,6 +60,7 @@ class DeviceSession:
         )
         if session is None:
             err = f"[ERROR] connect failed: {error}"
+            print(err, flush=True)
             self.log(err)
             return False
         self._session = session
