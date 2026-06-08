@@ -12,7 +12,7 @@ class Config:
             self.load(path)
 
     def load(self, path: str) -> None:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             content = f.read()
         self._parser.read_string("[scrcpy]\n" + content)
 
