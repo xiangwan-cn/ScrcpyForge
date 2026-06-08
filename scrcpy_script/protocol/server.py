@@ -165,7 +165,7 @@ def launch_server(
     if stay_awake:
         cmd += " stay_awake=true"
     cmd += " 2>&1 &"
-    os.system(cmd)
+    subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(2.0)
 
     session = ScrcpySession()
