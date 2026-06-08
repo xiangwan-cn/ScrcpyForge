@@ -130,6 +130,7 @@ def launch_server(
     # Push jar
     r = _adb(serial, f'push "{jar_path}" {SERVER_PATH}')
     if r.returncode != 0:
+        print(f"[launch] PUSH FAILED: {r.stderr.strip()}", flush=True)
         return None, f"Push failed: {r.stderr.strip()}"
 
     scid_hex = _generate_scid_hex()
@@ -142,6 +143,7 @@ def launch_server(
     for port, label in [(video_port, "video"), (control_port, "control")]:
         r = _adb(serial, f"forward tcp:{port} localabstract:scrcpy_{scid_hex}")
         if r.returncode != 0:
+            print(f"[launch] FORWARD {label}:{port} FAILED: {r.stderr.strip()}", flush=True)
             return None, f"{label} forward failed: {r.stderr.strip()}"
 
     # Launch server
@@ -172,6 +174,7 @@ def launch_server(
     session.control_port = control_port
 
     # Connect video socket with retry
+    print(f"[launch] connecting video {video_port}...", flush=True)
     video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     video_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     deadline = time.monotonic() + 6.0
@@ -181,9 +184,11 @@ def launch_server(
             video_sock.connect(("127.0.0.1", video_port))
             connected = True
             break
-        except (ConnectionRefusedError, OSError):
+        except Exception as e:
+            print(f"[launch] connect retry: {type(e).__name__}", flush=True)
             time.sleep(0.1)
     if not connected:
+        print(f"[launch] VIDEO CONNECT TIMEOUT", flush=True)
         video_sock.close()
         return None, "Video socket connect timeout"
 
@@ -192,9 +197,11 @@ def launch_server(
     try:
         dummy = video_sock.recv(1)
         if len(dummy) != 1:
+            print(f"[launch] DUMMY FAILED: len={len(dummy)}", flush=True)
             video_sock.close()
             return None, "Dummy byte read failed"
-    except OSError:
+    except Exception as e:
+        print(f"[launch] DUMMY EXCEPTION: {type(e).__name__} {e}", flush=True)
         video_sock.close()
         return None, "Dummy byte timeout"
     video_sock.settimeout(None)
@@ -204,7 +211,8 @@ def launch_server(
     control_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     try:
         control_sock.connect(("127.0.0.1", control_port))
-    except OSError:
+    except Exception as e:
+        print(f"[launch] CTRL CONNECT FAILED: {type(e).__name__} {e}", flush=True)
         video_sock.close()
         return None, "Control socket connect failed"
 
@@ -213,11 +221,13 @@ def launch_server(
     while len(name_bytes) < DEVICE_NAME_LENGTH:
         try:
             chunk = video_sock.recv(DEVICE_NAME_LENGTH - len(name_bytes))
-        except OSError:
+        except Exception as e:
+            print(f"[launch] DEVINFO EXCEPTION: {type(e).__name__} {e}", flush=True)
             video_sock.close()
             control_sock.close()
             return None, "Device info read failed"
         if not chunk:
+            print(f"[launch] DEVINFO TRUNCATED at {len(name_bytes)}", flush=True)
             video_sock.close()
             control_sock.close()
             return None, "Device info truncated"
@@ -229,11 +239,13 @@ def launch_server(
     while len(codec_buf) < 4:
         try:
             chunk = video_sock.recv(4 - len(codec_buf))
-        except OSError:
+        except Exception as e:
+            print(f"[launch] CODEC EXCEPTION: {type(e).__name__} {e}", flush=True)
             video_sock.close()
             control_sock.close()
             return None, "Codec ID read failed"
         if not chunk:
+            print(f"[launch] CODEC TRUNCATED at {len(codec_buf)}", flush=True)
             video_sock.close()
             control_sock.close()
             return None, "Codec ID truncated"
