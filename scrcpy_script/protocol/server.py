@@ -172,7 +172,10 @@ def launch_server(
 
     # Connect video socket with retry
     video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    video_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        video_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
     deadline = time.monotonic() + 6.0
     connected = False
     while time.monotonic() < deadline:
@@ -187,7 +190,10 @@ def launch_server(
         return None, "Video socket connect timeout"
 
     # Read dummy byte
-    video_sock.settimeout(3.0)
+    try:
+        video_sock.settimeout(3.0)
+    except OSError:
+        pass
     try:
         dummy = video_sock.recv(1)
         if len(dummy) != 1:
@@ -196,11 +202,17 @@ def launch_server(
     except OSError:
         video_sock.close()
         return None, "Dummy byte timeout"
-    video_sock.settimeout(None)
+    try:
+        video_sock.settimeout(None)
+    except OSError:
+        pass
 
     # Connect control socket with retry
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    control_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    try:
+        control_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    except OSError:
+        pass
     ctrl_connected = False
     ctrl_deadline = time.monotonic() + 3.0
     while time.monotonic() < ctrl_deadline:
