@@ -72,12 +72,15 @@ class DeviceManager:
             return None
         video_port, control_port = self._alloc_ports()
         session = DeviceSession(serial)
-        if not session.connect(
+        print(f"[connect_device] before connect {serial}", flush=True)
+        ok = session.connect(
             video_port=video_port, control_port=control_port,
             max_size=params["max_size"], max_fps=params["max_fps"],
             bit_rate=params["bit_rate"], video_codec=params["video_codec"],
             jar_path=params["jar_path"],
-        ):
+        )
+        print(f"[connect_device] after connect {serial} ok={ok}", flush=True)
+        if not ok:
             self._failed_serials[serial] = time.monotonic()
             self._connecting.discard(serial)
             return None
