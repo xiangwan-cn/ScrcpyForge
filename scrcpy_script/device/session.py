@@ -65,31 +65,10 @@ class DeviceSession:
             return False
         self._session = session
         self._device_name = session.device_name or self._serial
-
-        print(
-            f"[SESSION] launch_server success "
-            f"{self._serial}",
-            flush=True,
-        )
-
         self._connected = True
         self._stop_decode = False
-
-        print(
-            f"[SESSION] starting decode thread "
-            f"{self._serial}",
-            flush=True,
-        )
-
         self._decode_thread = threading.Thread(target=self._decode_loop, daemon=True)
         self._decode_thread.start()
-
-        print(
-            f"[SESSION] decode thread started "
-            f"{self._serial}",
-            flush=True,
-        )
-
         self.log(f"[INFO] Connected ({session.device_name})")
         return True
 
@@ -111,43 +90,11 @@ class DeviceSession:
             self._disconnect_cb(self._serial)
 
     def _decode_loop(self) -> None:
-        print(
-            f"[DECODE] thread enter "
-            f"{self._serial}",
-            flush=True,
-        )
-
         codec = av.CodecContext.create("h264", "r")
-
-        print(
-            f"[DECODE] codec created "
-            f"{self._serial}",
-            flush=True,
-        )
-
         try:
             while not self._stop_decode and self._session is not None:
-                print(
-                    f"[DECODE] waiting packet "
-                    f"{self._serial}",
-                    flush=True,
-                )
-
                 pkt_info = self._session.read_packet()
-
-                print(
-                    f"[DECODE] packet="
-                    f"{pkt_info is not None} "
-                    f"{self._serial}",
-                    flush=True,
-                )
-
                 if pkt_info is None:
-                    print(
-                        f"[DECODE] read_packet NONE "
-                        f"{self._serial}",
-                        flush=True,
-                    )
 
                     self.log("[WARN] Video stream ended")
                     break
@@ -193,22 +140,8 @@ class DeviceSession:
                 except Exception as e:
                     self.log(f"[WARN] Decode drop: {e}")
         except Exception as e:
-            import traceback
-
-            print(
-                f"[DECODE] EXCEPTION {self._serial}",
-                flush=True,
-            )
-
-            traceback.print_exc()
-
             self.log(f"[ERROR] Decode error: {e}")
         finally:
-            print(
-                f"[DECODE] EXIT {self._serial}",
-                flush=True,
-            )
-
             self._connected = False
             if self._disconnect_cb:
                 self._disconnect_cb(self._serial)
