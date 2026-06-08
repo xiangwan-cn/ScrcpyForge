@@ -72,14 +72,18 @@ class DeviceManager:
             return None
         video_port, control_port = self._alloc_ports()
         session = DeviceSession(serial)
-        print(f"[connect_device] before connect {serial}", flush=True)
+
+        print(f"[DM] connect_device start {serial}", flush=True)
+
         ok = session.connect(
             video_port=video_port, control_port=control_port,
             max_size=params["max_size"], max_fps=params["max_fps"],
             bit_rate=params["bit_rate"], video_codec=params["video_codec"],
             jar_path=params["jar_path"],
         )
-        print(f"[connect_device] after connect {serial} ok={ok}", flush=True)
+
+        print(f"[DM] connect_device result {serial} -> {ok}", flush=True)
+
         if not ok:
             self._failed_serials[serial] = time.monotonic()
             self._connecting.discard(serial)
@@ -87,6 +91,12 @@ class DeviceManager:
         session.set_disconnect_callback(self._on_disconnect)
         with self._lock:
             self._sessions[serial] = session
+
+        print(
+            f"[DM] ADDED SESSION {serial} "
+            f"count={len(self._sessions)}",
+            flush=True,
+        )
         self._connecting.discard(serial)
         return session
 
@@ -104,8 +114,14 @@ class DeviceManager:
         return False
 
     def _on_disconnect(self, serial: str) -> None:
+        print(f"[DM] DISCONNECT {serial}", flush=True)
         with self._lock:
             self._sessions.pop(serial, None)
+        print(
+            f"[DM] REMOVED SESSION {serial} "
+            f"count={len(self._sessions)}",
+            flush=True,
+        )
 
     def remove_session(self, serial: str) -> None:
         with self._lock:
