@@ -123,21 +123,26 @@ class DeviceSession:
                         self._fmt_check = True
                         self.log(f"[FMT] first 8 bytes: {data[:8].hex()} len={len(data)}")
 
-                    packets = codec.parse(data)
-                    for pkt in packets:
-                        frames = codec.decode(pkt)
-                        for frame in frames:
-                            img = frame.to_ndarray(format="bgr24")
-                            self._cached_frame = img
-                            try:
-                                self._frame_queue.put_nowait(img)
-                            except queue.Full:
+                    # Split Annex-B into individual NALs and feed to decode
+                    nals = [b"\x00\x00\x00\x01" + n for n in data.split(b"\x00\x00\x00\x01") if n]
+                    for nal in nals:
+                        try:
+                            pkt = av.Packet(nal)
+                            frames = codec.decode(pkt)
+                            for frame in frames:
+                                img = frame.to_ndarray(format="bgr24")
+                                self._cached_frame = img
                                 try:
-                                    self._frame_queue.get_nowait()
                                     self._frame_queue.put_nowait(img)
-                                except queue.Empty:
-                                    pass
-                            self._update_fps()
+                                except queue.Full:
+                                    try:
+                                        self._frame_queue.get_nowait()
+                                        self._frame_queue.put_nowait(img)
+                                    except queue.Empty:
+                                        pass
+                                self._update_fps()
+                        except Exception:
+                            pass
                 except Exception:
                     pass
         except Exception as e:
