@@ -138,7 +138,9 @@ class DeviceSession:
                                     pass
                             self._update_fps()
                 except Exception as e:
-                    self.log(f"[WARN] Decode drop: {e}")
+                    if not getattr(self, "_decode_drop_cnt", 0):
+                        self.log(f"[WARN] Decode drop: {e} (further drops suppressed)")
+                    self._decode_drop_cnt = getattr(self, "_decode_drop_cnt", 0) + 1
         except Exception as e:
             self.log(f"[ERROR] Decode error: {e}")
         finally:
