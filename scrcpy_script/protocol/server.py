@@ -137,11 +137,11 @@ def _launch_server(
     video_encoder: str = "",
     stay_awake: bool = True,
 ) -> tuple[Optional[ScrcpySession], Optional[str]]:
-    # Kill stale servers (best-effort, may fail on Windows)
+    # Kill stale servers (best-effort)
     try:
         subprocess.run(
-            f"adb -s {serial} shell pkill -9 -f app_process.*scrcpy",
-            shell=True, capture_output=True, timeout=5,
+            ["adb", "-s", serial, "shell", "pkill -9 -f app_process.*scrcpy"],
+            capture_output=True, timeout=5,
         )
     except Exception:
         pass
