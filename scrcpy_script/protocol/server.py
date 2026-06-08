@@ -119,6 +119,26 @@ def launch_server(
     video_codec: str = "h264",
     stay_awake: bool = True,
 ) -> tuple[Optional[ScrcpySession], Optional[str]]:
+    try:
+        return _launch_server(serial, video_port, control_port, jar_path,
+                               max_size, bit_rate, max_fps, video_codec, stay_awake)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return None, str(e)
+
+
+def _launch_server(
+    serial: str,
+    video_port: int,
+    control_port: int,
+    jar_path: str = "scrcpy-server-v4.0.jar",
+    max_size: int = 1280,
+    bit_rate: int = 8000000,
+    max_fps: int = 60,
+    video_codec: str = "h264",
+    stay_awake: bool = True,
+) -> tuple[Optional[ScrcpySession], Optional[str]]:
     # Kill stale servers
     subprocess.run(
         f"adb -s {serial} shell 'pkill -9 -f app_process.*scrcpy' 2>/dev/null",
@@ -171,23 +191,31 @@ def launch_server(
     session.control_port = control_port
 
     # Connect video socket with retry
-    video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
-        video_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    except OSError:
-        pass
-    deadline = time.monotonic() + 6.0
-    connected = False
-    while time.monotonic() < deadline:
-        try:
-            video_sock.connect(("127.0.0.1", video_port))
-            connected = True
-            break
-        except (ConnectionRefusedError, OSError):
-            time.sleep(0.1)
-    if not connected:
-        video_sock.close()
-        return None, "Video socket connect timeout"
+        deadline = time.monotonic() + 6.0
+        connected = False
+        while time.monotonic() < deadline:
+            try:
+                video_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                try:
+                    video_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass
+                video_sock.connect(("127.0.0.1", video_port))
+                connected = True
+                break
+            except OSError as e:
+                print(f"[launch] video connect retry: {e}", flush=True)
+                try:
+                    video_sock.close()
+                except OSError:
+                    pass
+                time.sleep(0.1)
+        if not connected:
+            return None, "Video socket connect timeout"
+    except Exception as e:
+        print(f"[launch] VIDEO SOCKET SETUP ERROR: {type(e).__name__} {e}", flush=True)
+        return None, "Video socket error"
 
     # Read dummy byte
     try:
