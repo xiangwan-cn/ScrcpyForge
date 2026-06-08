@@ -125,15 +125,11 @@ class DeviceSession:
                     continue
 
                 try:
-                    packets = codec.parse(ANNEX_B_PREFIX + data)
-                    if getattr(self, "_parse_first", True):
-                        self._parse_first = False
-                        self.log(f"[DEBUG] parse: {len(packets)} packets from {len(data)} bytes")
-                    for pkt in packets:
-                        frames = codec.decode(pkt)
-                        if getattr(self, "_frame_first", True) and frames:
-                            self._frame_first = False
-                            self.log(f"[DEBUG] decode: {len(frames)} frames")
+                    pkt = av.Packet(ANNEX_B_PREFIX + data)
+                    frames = codec.decode(pkt)
+                    if getattr(self, "_frame_first", True) and frames:
+                        self._frame_first = False
+                        self.log(f"[DEBUG] decode: {len(frames)} frames")
                         for frame in frames:
                             img = frame.to_ndarray(format="bgr24")
                             self._cached_frame = img
