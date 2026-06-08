@@ -173,8 +173,7 @@ def _launch_server(
         f"tunnel_forward=true send_frame_meta=true send_dummy_byte=true "
         f"cleanup=false "
         f"max_size={max_size} "
-        f"video_codec={video_codec} "
-        f"video_codec_options=profile=1,level=3.1"  # Baseline profile for FFmpeg compat
+        f"video_codec={video_codec}"
     )
     if bit_rate > 0:
         cmd += f" video_bit_rate={bit_rate}"
