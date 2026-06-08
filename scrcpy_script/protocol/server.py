@@ -206,15 +206,24 @@ def launch_server(
         return None, "Dummy byte timeout"
     video_sock.settimeout(None)
 
-    # Connect control socket
+    # Connect control socket with retry
     control_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     control_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    try:
-        control_sock.connect(("127.0.0.1", control_port))
-    except Exception as e:
-        print(f"[launch] CTRL CONNECT FAILED: {type(e).__name__} {e}", flush=True)
+    ctrl_connected = False
+    ctrl_deadline = time.monotonic() + 3.0
+    while time.monotonic() < ctrl_deadline:
+        try:
+            control_sock.connect(("127.0.0.1", control_port))
+            ctrl_connected = True
+            break
+        except Exception as e:
+            print(f"[launch] ctrl retry: {type(e).__name__}", flush=True)
+            time.sleep(0.1)
+    if not ctrl_connected:
+        print(f"[launch] CTRL CONNECT TIMEOUT", flush=True)
         video_sock.close()
-        return None, "Control socket connect failed"
+        control_sock.close()
+        return None, "Control socket connect timeout"
 
     # Read device info (64 bytes name) from video socket
     name_bytes = bytearray()
