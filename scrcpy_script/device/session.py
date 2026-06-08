@@ -121,23 +121,15 @@ class DeviceSession:
                     continue
 
                 try:
+                    # Debug: check Annex-B format on first data packet
+                    if not getattr(self, "_fmt_check", False):
+                        self._fmt_check = True
+                        self.log(f"[FMT] first 8 bytes: {data[:8].hex()} len={len(data)}")
+
                     packets = codec.parse(ANNEX_B_PREFIX + data)
                     for pkt in packets:
                         frames = codec.decode(pkt)
                         for frame in frames:
-                            img = frame.to_ndarray(format="bgr24")
-                            self._cached_frame = img
-                            try:
-                                self._frame_queue.put_nowait(img)
-                            except queue.Full:
-                                try:
-                                    self._frame_queue.get_nowait()
-                                    self._frame_queue.put_nowait(img)
-                                except queue.Empty:
-                                    pass
-                            self._update_fps()
-                except Exception:
-                    pass
         except Exception as e:
             self.log(f"[ERROR] Decode error: {e}")
         finally:
