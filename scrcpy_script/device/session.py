@@ -94,6 +94,7 @@ class DeviceSession:
     def _decode_loop(self) -> None:
         codec = av.CodecContext.create("h264", "r")
         has_frame = False
+        need_reinit = False
         first_pkt_at = time.monotonic()
         try:
             while not self._stop_decode and self._session is not None:
@@ -113,8 +114,9 @@ class DeviceSession:
                 if pkt_info.get("is_session"):
                     new_w = pkt_info.get("video_width", self._video_size[0])
                     new_h = pkt_info.get("video_height", self._video_size[1])
-                    if (new_w, new_h) != self._video_size:
+                    if (new_w, new_h) != self._video_size and self._video_size != (0, 0):
                         self.log(f"[INFO] Resolution: {self._video_size} -> ({new_w}, {new_h})")
+                        need_reinit = True
                     self._video_size = (new_w, new_h)
                     self._screen_size = self._video_size
                     continue
@@ -124,6 +126,12 @@ class DeviceSession:
                     continue
 
                 if pkt_info.get("is_config"):
+                    if need_reinit:
+                        try:
+                            codec = av.CodecContext.create("h264", "r")
+                        except Exception:
+                            pass
+                        need_reinit = False
                     try:
                         codec.extradata = data
                     except Exception:
