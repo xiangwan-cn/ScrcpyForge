@@ -16,12 +16,43 @@ from scrcpy_script.protocol.control import (
     BACK_ACTION,
     TouchAction,
 )
-from scrcpy_script.protocol.server import launch_server, ANNEX_B_PREFIX
+from scrcpy_script.protocol.server import launch_server
 
 QUEUE_DEPTH = 2
 SWIPE_STEP_MS = 16
 MIN_SWIPE_STEPS = 2
-FALLBACK_TIMEOUT = 5.0  # seconds without frame → switch encoder
+FALLBACK_TIMEOUT = 5.0
+ANNEX_B_PREFIX = b"\x00\x00\x00\x01"
+ANNEX_B_3B = b"\x00\x00\x01"
+
+
+def _yuv420p_to_bgr(frame) -> np.ndarray:
+    """Convert a YUV420P VideoFrame to BGR24 numpy array via OpenCV."""
+    import cv2
+
+    h, w = frame.height, frame.width
+    h2, w2 = h // 2, w // 2
+    total_h = h * 3 // 2
+
+    i420 = np.zeros((total_h, w), dtype=np.uint8)
+
+    y = np.frombuffer(bytes(frame.planes[0]), dtype=np.uint8)
+    y = y.reshape((h, frame.planes[0].line_size))[:, :w]
+    i420[:h, :] = y
+
+    u = np.frombuffer(bytes(frame.planes[1]), dtype=np.uint8)
+    u = u.reshape((h2, frame.planes[1].line_size))[:, :w2]
+    u = u.ravel()
+    u_rows = h2 * w2 // w
+    i420[h : h + u_rows, :] = u[: u_rows * w].reshape((u_rows, w))
+
+    v = np.frombuffer(bytes(frame.planes[2]), dtype=np.uint8)
+    v = v.reshape((h2, frame.planes[2].line_size))[:, :w2]
+    v = v.ravel()
+    v_rows = h2 * w2 // w
+    i420[h + u_rows : h + u_rows * 2, :] = v[: v_rows * w].reshape((v_rows, w))
+
+    return cv2.cvtColor(i420, cv2.COLOR_YUV2BGR_I420)
 
 
 class DeviceSession:
@@ -92,33 +123,45 @@ class DeviceSession:
             self._disconnect_cb(self._serial)
 
     def _decode_loop(self) -> None:
-        codec = av.CodecContext.create("h264", "r")
+        codec = None
         has_frame = False
         need_reinit = False
         first_pkt_at = time.monotonic()
+        pending_config: Optional[bytes] = None
         try:
             while not self._stop_decode and self._session is not None:
                 if not has_frame and time.monotonic() - first_pkt_at > FALLBACK_TIMEOUT:
                     self.log("[WARN] No frames — requesting encoder fallback")
                     self._connected = False
+                    self._stop_decode = True
                     if self._disconnect_cb:
                         self._disconnect_cb(self._serial)
                     return
 
                 pkt_info = self._session.read_packet()
                 if pkt_info is None:
-
                     self.log("[WARN] Video stream ended")
                     break
 
                 if pkt_info.get("is_session"):
-                    new_w = pkt_info.get("video_width", self._video_size[0])
-                    new_h = pkt_info.get("video_height", self._video_size[1])
-                    if (new_w, new_h) != self._video_size and self._video_size != (0, 0):
-                        self.log(f"[INFO] Resolution: {self._video_size} -> ({new_w}, {new_h})")
-                        need_reinit = True
+                    new_w = pkt_info.get("video_width", 0)
+                    new_h = pkt_info.get("video_height", 0)
+                    old_size = self._video_size
                     self._video_size = (new_w, new_h)
                     self._screen_size = self._video_size
+                    if old_size == (0, 0) or need_reinit:
+                        codec = av.CodecContext.create("h264", "r")
+                        codec.flags |= 0x8000  # AV_CODEC_FLAG_LOW_DELAY
+                        codec.width = new_w
+                        codec.height = new_h
+                        codec.pix_fmt = "yuv420p"
+                        pending_config = None
+                        need_reinit = False
+                    if old_size != (0, 0) and (new_w, new_h) != old_size:
+                        self.log(f"[INFO] Resolution: {old_size} -> ({new_w}, {new_h})")
+                    continue
+
+                if codec is None:
                     continue
 
                 data = pkt_info.get("data")
@@ -126,43 +169,39 @@ class DeviceSession:
                     continue
 
                 if pkt_info.get("is_config"):
-                    if need_reinit:
-                        try:
-                            codec = av.CodecContext.create("h264", "r")
-                        except Exception:
-                            pass
-                        need_reinit = False
-                    try:
-                        codec.extradata = data
-                    except Exception:
-                        pass
+                    if not data.startswith(ANNEX_B_PREFIX) and not data.startswith(ANNEX_B_3B):
+                        data = ANNEX_B_PREFIX + data
+                    pending_config = data
                     continue
 
+                if pending_config:
+                    data = pending_config + data
+                    pending_config = None
+
                 try:
-                    packets = codec.parse(ANNEX_B_PREFIX + data)
-                    for pkt in packets:
-                        frames = codec.decode(pkt)
-                        for frame in frames:
-                            img = frame.to_ndarray(format="bgr24")
-                            self._cached_frame = img
+                    packet = av.Packet(data)
+                    if pkt_info.get("is_keyframe"):
+                        packet.is_keyframe = True
+                    for frame in codec.decode(packet):
+                        img = _yuv420p_to_bgr(frame)
+                        self._cached_frame = img
+                        try:
+                            self._frame_queue.put_nowait(img)
+                        except queue.Full:
                             try:
+                                self._frame_queue.get_nowait()
                                 self._frame_queue.put_nowait(img)
-                            except queue.Full:
-                                try:
-                                    self._frame_queue.get_nowait()
-                                    self._frame_queue.put_nowait(img)
-                                except queue.Empty:
-                                    pass
-                            self._update_fps()
-                            has_frame = True
-                except Exception:
-                    pass
+                            except queue.Empty:
+                                pass
+                        self._update_fps()
+                        has_frame = True
                 except Exception:
                     pass
         except Exception as e:
             self.log(f"[ERROR] Decode error: {e}")
         finally:
             self._connected = False
+            self._stop_decode = True
             if self._disconnect_cb:
                 self._disconnect_cb(self._serial)
 

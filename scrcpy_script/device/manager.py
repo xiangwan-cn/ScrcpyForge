@@ -68,8 +68,11 @@ class DeviceManager:
         params.setdefault("video_encoder", "")
         params.setdefault("jar_path", "scrcpy-server-v4.0.jar")
 
-        # Apply per-serial encoder fallback
+        # Apply per-serial encoder fallback, respecting config preference
         idx = self._encoder_idx.get(serial, 0)
+        cfg_encoder = params.get("video_encoder", "")
+        if cfg_encoder and cfg_encoder in self._FALLBACK_ENCODERS:
+            idx = max(idx, self._FALLBACK_ENCODERS.index(cfg_encoder))
         if idx < len(self._FALLBACK_ENCODERS):
             params["video_encoder"] = self._FALLBACK_ENCODERS[idx]
 
