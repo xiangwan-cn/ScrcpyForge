@@ -1,10 +1,13 @@
 """Multi-device discovery and lifecycle management."""
+import os
 import subprocess
 import threading
 import time
 from typing import Optional
 
 from scrcpy_script.device.session import DeviceSession
+
+_WIN_RUN = {"creationflags": 0x08000000} if os.name == "nt" else {}
 
 
 class DeviceManager:
@@ -40,7 +43,8 @@ class DeviceManager:
     def discover(self) -> list[str]:
         try:
             result = subprocess.run(
-                ["adb", "devices"], capture_output=True, text=True, timeout=5
+                ["adb", "devices"], capture_output=True, text=True, timeout=5,
+                **_WIN_RUN,
             )
             lines = result.stdout.strip().split("\n")[1:]
             return [
@@ -104,7 +108,8 @@ class DeviceManager:
     def _is_device_authorized(self, serial: str) -> bool:
         try:
             result = subprocess.run(
-                ["adb", "devices"], capture_output=True, text=True, timeout=5
+                ["adb", "devices"], capture_output=True, text=True, timeout=5,
+                **_WIN_RUN,
             )
             for line in result.stdout.strip().split("\n"):
                 parts = line.split("\t")
@@ -187,7 +192,8 @@ class DeviceManager:
         try:
             subprocess.run(
                 ["adb", "connect", f"{ip_addr}:{port}"],
-                capture_output=True, timeout=10
+                capture_output=True, timeout=10,
+                **_WIN_RUN,
             )
             time.sleep(1.0)
             serials = self.discover()

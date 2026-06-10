@@ -20,6 +20,8 @@ class ScrcpyLauncher:
         kwargs = {}
         if os.name != "nt":
             kwargs["preexec_fn"] = os.setsid
+        else:
+            kwargs["creationflags"] = 0x08000000
 
         proc = subprocess.Popen(
             ["scrcpy", "-s", serial, "-m", str(size)],

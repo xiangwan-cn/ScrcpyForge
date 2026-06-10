@@ -1,5 +1,6 @@
 """Single device card with preview, script controls, and log."""
 import importlib.util
+import os
 import subprocess
 from pathlib import Path
 from types import ModuleType
@@ -144,9 +145,13 @@ class DeviceCard:
             self._session.log("[INFO] Script stopped")
 
     def _on_open_scrcpy(self) -> None:
+        kwargs = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = 0x08000000
         subprocess.Popen(
             ["scrcpy", "-s", self._session.serial()],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            **kwargs,
         )
 
     def _on_screenshot(self) -> None:

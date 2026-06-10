@@ -1,9 +1,12 @@
 """scrcpy v4.0 server launch via ADB + video packet reader."""
+import os
 import random
 import socket
 import subprocess
 import time
 from typing import Optional
+
+_WIN_FLAGS = {"creationflags": 0x08000000} if os.name == "nt" else {}
 
 
 SERVER_PATH = "/data/local/tmp/scrcpy-server-v4.0.jar"
@@ -105,6 +108,7 @@ def _adb(serial: str, args: str) -> subprocess.CompletedProcess:
     return subprocess.run(
         f"adb -s {serial} {args}",
         shell=True, capture_output=True, text=True, timeout=30,
+        **_WIN_FLAGS,
     )
 
 
@@ -142,6 +146,7 @@ def _launch_server(
         subprocess.run(
             ["adb", "-s", serial, "shell", "pkill -9 -f app_process.*scrcpy"],
             capture_output=True, timeout=5,
+            **_WIN_FLAGS,
         )
     except Exception:
         pass
@@ -156,7 +161,8 @@ def _launch_server(
 
     # Remove stale forwards
     subprocess.run(f"adb -s {serial} forward --remove-all", shell=True,
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                   **_WIN_FLAGS)
 
     # Forward ports
     for port, label in [(video_port, "video"), (control_port, "control")]:
@@ -184,7 +190,8 @@ def _launch_server(
         cmd += f" max_fps={max_fps}"
     if stay_awake:
         cmd += " stay_awake=true"
-    subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     **_WIN_FLAGS)
     time.sleep(2.0)
 
     session = ScrcpySession()
