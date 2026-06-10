@@ -14,7 +14,7 @@ pip install --break-system-packages -r requirements.txt
 python scrcpy_script/main.py
 
 # Headless: connect a specific device and run a script
-python scrcpy_script/main.py --device <SERIAL> --script scrcpy_script/scripts/test_tap.py
+python scrcpy_script/main.py --device <SERIAL>
 ```
 
 **Prerequisites:** adb in PATH, Android device with USB debugging enabled.
@@ -48,8 +48,10 @@ scrcpy_script/
 ├── script/
 │   └── runner.py            # Script thread with threading.Event stop signal
 ├── scripts/
-│   ├── test_tap.py          # Example: tap screen center every 2s
-│   └── test_core.py         # Example: frame receipt + find() latency test
+│   ├── match_tap/            # Example: template match + tap
+│   │   ├── manifest.py       # NAME = display name
+│   │   └── script.py
+│   └── example_all_api/      # Example: all API methods demo
 ├── ui/
 │   ├── app.py               # DearPyGui main window, toolbar
 │   ├── device_card.py       # Per-device card (preview, controls, log)
@@ -59,7 +61,7 @@ scrcpy_script/
 └── templates/               # Saved template images (.png)
 ```
 
-17 Python files, ~1800 lines. C++ equivalent was 5508 lines (67% reduction).
+17 Python files, ~1700 lines.
 
 ## Architecture
 
@@ -109,14 +111,20 @@ scripts_dir=scrcpy_script/scripts
 templates_dir=templates
 ```
 
-CLI overrides config: `--device`, `--config`, `--jar`, `--adb`.
+CLI overrides config: `--device`, `--config`, `--jar`.
 
 ## Writing Scripts
 
-Scripts are Python modules with a `script(api)` function. Place them in `scripts_dir`.
+Scripts are Python modules with a `script(api)` function. Place them in `scripts_dir` using a directory structure:
+
+```
+scripts/<name>/
+├── manifest.py    # NAME = "Display Name" (optional)
+└── script.py      # def script(api): ...
+```
 
 ```python
-# scripts/my_script.py
+# scripts/my_script/script.py
 def script(api):
     api.log(f"Running on {api.device_serial()}")
     while True:
@@ -142,7 +150,7 @@ Implements scrcpy v4.0 wire protocol directly:
 2. Launch `app_process` with `tunnel_forward=true send_frame_meta=true send_dummy_byte=true`
 3. Connect video socket → read dummy byte → connect control socket
 4. Read device name (64 bytes) + codec ID (4 bytes)
-5. PyAV `av.CodecContext("h264")` decodes raw H.264 NAL units (12-byte scrcpy header stripped, Annex B prefix added)
+5. PyAV decodes raw H.264 stream with config+media merging (matching scrcpy packet_merger)
 6. Control socket sends 14/32-byte big-endian messages for touch/key/text injection
 
 All integers big-endian, matching scrcpy v4.0 spec.

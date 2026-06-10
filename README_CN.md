@@ -113,7 +113,7 @@ scripts_dir=scrcpy_script/scripts
 templates_dir=templates
 ```
 
-命令行可覆盖配置：`--device`、`--config`、`--jar`、`--adb`。
+命令行可覆盖配置：`--device`、`--config`、`--jar`。
 
 ## 编写脚本
 
