@@ -1,5 +1,8 @@
 """Configuration reader for scrcpy_config.conf (key=value format)."""
 import configparser
+import os
+import sys
+from pathlib import Path
 from typing import Optional
 
 
@@ -74,3 +77,18 @@ class Config:
     @property
     def jar_path(self) -> str:
         return self.get("server_jar", "scrcpy-server-v4.0.jar")
+
+    @property
+    def scrcpy_path(self) -> str:
+        return self.get("scrcpy_path", "")
+
+
+def resolve_scrcpy_path(custom_path: str = "") -> str:
+    if custom_path:
+        return custom_path
+    app_dir = Path(sys.executable).parent if getattr(sys, "frozen", False) else Path.cwd()
+    suffix = ".exe" if os.name == "nt" else ""
+    bundled = app_dir / "scrcpy" / f"scrcpy{suffix}"
+    if bundled.is_file():
+        return str(bundled)
+    return "scrcpy"

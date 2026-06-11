@@ -4,6 +4,8 @@ import signal
 import subprocess
 from typing import Optional
 
+from scrcpy_script.config import resolve_scrcpy_path
+
 
 class ScrcpyLauncher:
     def __init__(self, max_size: int = 1280) -> None:
@@ -24,7 +26,7 @@ class ScrcpyLauncher:
             kwargs["creationflags"] = 0x08000000
 
         proc = subprocess.Popen(
-            ["scrcpy", "-s", serial, "-m", str(size)],
+            [resolve_scrcpy_path(), "-s", serial, "-m", str(size)],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             **kwargs,
         )

@@ -10,6 +10,7 @@ import dearpygui.dearpygui as dpg
 import numpy as np
 
 from scrcpy_script.api import ScriptAPI
+from scrcpy_script.config import resolve_scrcpy_path
 from scrcpy_script.script.runner import ScriptRunner
 from scrcpy_script.ui.log_panel import LogPanel
 
@@ -149,10 +150,13 @@ class DeviceCard:
         if os.name == "nt":
             kwargs["creationflags"] = 0x08000000
         subprocess.Popen(
-            ["scrcpy", "-s", self._session.serial()],
+            [resolve_scrcpy_path(), "-s", self._session.serial()],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             **kwargs,
         )
+
+    def _on_toggle_screen(self) -> None:
+        self._session.toggle_screen()
 
     def _on_screenshot(self) -> None:
         import scrcpy_script.ui.region_picker as rp
