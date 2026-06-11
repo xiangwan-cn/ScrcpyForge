@@ -77,6 +77,8 @@ class DeviceCard:
                                tag=f"{tag}_stop", show=False)
                 dpg.add_button(label="Screenshot", callback=lambda: self._on_screenshot(),
                                tag=f"{tag}_shot")
+                dpg.add_button(label="Screen", callback=lambda: self._on_toggle_screen(),
+                               tag=f"{tag}_screen")
                 dpg.add_button(label="Open scrcpy", callback=lambda: self._on_open_scrcpy(),
                                tag=f"{tag}_scrcpy")
 
@@ -154,6 +156,9 @@ class DeviceCard:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             **kwargs,
         )
+
+    def _on_toggle_screen(self) -> None:
+        self._session.toggle_screen()
 
     def _on_toggle_screen(self) -> None:
         self._session.toggle_screen()

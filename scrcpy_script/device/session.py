@@ -13,7 +13,10 @@ from scrcpy_script.protocol.control import (
     build_inject_text,
     build_inject_touch,
     build_back_or_screen_on,
+    build_set_screen_power_mode,
     BACK_ACTION,
+    SCREEN_POWER_OFF,
+    SCREEN_POWER_ON,
     TouchAction,
 )
 from scrcpy_script.protocol.server import launch_server
@@ -269,6 +272,12 @@ class DeviceSession:
 
     def inject_back(self) -> None:
         self._send_control(build_back_or_screen_on(BACK_ACTION))
+
+    def toggle_screen(self) -> None:
+        self._screen_on = not getattr(self, "_screen_on", True)
+        mode = SCREEN_POWER_ON if self._screen_on else SCREEN_POWER_OFF
+        self._send_control(build_set_screen_power_mode(mode))
+        self.log(f"[INFO] Screen {'on' if self._screen_on else 'off'}")
 
     def inject_text(self, text: str) -> None:
         self._send_control(build_inject_text(text))

@@ -8,6 +8,7 @@ class ControlType:
     INJECT_TOUCH = 2
     INJECT_SCROLL = 3
     BACK_OR_SCREEN_ON = 4
+    SET_SCREEN_POWER_MODE = 10
 
 
 class TouchAction:
@@ -76,3 +77,14 @@ def build_back_or_screen_on(action: int) -> bytes:
 
 
 BACK_ACTION = 0
+
+
+def build_set_screen_power_mode(mode: int) -> bytes:
+    """mode: 0=OFF, 1=DOZE, 2=ON, 3=DOZE_SUSPEND"""
+    return bytes([ControlType.SET_SCREEN_POWER_MODE, mode])
+
+
+SCREEN_POWER_OFF = 0
+SCREEN_POWER_DOZE = 1
+SCREEN_POWER_ON = 2
+SCREEN_POWER_DOZE_SUSPEND = 3
