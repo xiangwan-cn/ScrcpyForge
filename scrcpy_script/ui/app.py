@@ -7,6 +7,34 @@ from scrcpy_script.device.manager import DeviceManager
 from scrcpy_script.ui.device_card import DeviceCard
 from scrcpy_script.ui import region_picker
 
+CARD_WIDTH = 370
+
+# ── dark theme ────────────────────────────────────────
+def _set_dark_theme():
+    with dpg.theme() as global_theme:
+        with dpg.theme_component(dpg.mvAll):
+            dpg.add_theme_color(dpg.mvThemeCol_WindowBg, [14, 17, 22])
+            dpg.add_theme_color(dpg.mvThemeCol_ChildBg, [20, 24, 35])
+            dpg.add_theme_color(dpg.mvThemeCol_FrameBg, [26, 31, 44])
+            dpg.add_theme_color(dpg.mvThemeCol_Button, [30, 36, 50])
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonHovered, [40, 48, 66])
+            dpg.add_theme_color(dpg.mvThemeCol_ButtonActive, [50, 60, 80])
+            dpg.add_theme_color(dpg.mvThemeCol_Border, [36, 42, 56])
+            dpg.add_theme_color(dpg.mvThemeCol_Text, [215, 221, 229])
+            dpg.add_theme_color(dpg.mvThemeCol_TextDisabled, [110, 118, 135])
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarBg, [20, 24, 35])
+            dpg.add_theme_color(dpg.mvThemeCol_ScrollbarGrab, [40, 48, 66])
+            dpg.add_theme_color(dpg.mvThemeCol_Header, [30, 36, 50])
+            dpg.add_theme_color(dpg.mvThemeCol_HeaderHovered, [40, 48, 66])
+            dpg.add_theme_color(dpg.mvThemeCol_TitleBg, [20, 24, 35])
+            dpg.add_theme_color(dpg.mvThemeCol_TitleBgActive, [26, 31, 44])
+            dpg.add_theme_style(dpg.mvStyleVar_FrameRounding, 5)
+            dpg.add_theme_style(dpg.mvStyleVar_ChildRounding, 8)
+            dpg.add_theme_style(dpg.mvStyleVar_WindowRounding, 0)
+            dpg.add_theme_style(dpg.mvStyleVar_ItemSpacing, 6, 4)
+            dpg.add_theme_style(dpg.mvStyleVar_FramePadding, 6, 4)
+    dpg.bind_theme(global_theme)
+
 
 class UiApp:
     def __init__(self) -> None:
@@ -20,6 +48,7 @@ class UiApp:
         self._manager = device_manager
         self._scripts_dir = scripts_dir
         dpg.create_context()
+        _set_dark_theme()
         dpg.create_viewport(title="ScrcpyForge", width=1400, height=900)
         dpg.setup_dearpygui()
 
@@ -71,8 +100,8 @@ class UiApp:
                     if dpg.does_item_exist(tex_reg):
                         dpg.delete_item(tex_reg)
 
-        vp_w = dpg.get_viewport_width()
         vp_h = dpg.get_viewport_height()
+        card_h = max(400, vp_h - 170)
 
         for session in sessions:
             serial = session.serial()
@@ -81,22 +110,7 @@ class UiApp:
                 card.build("device_grid")
                 self._cards[serial] = card
 
-            # Card height fills viewport, width wraps preview aspect ratio
-            frame = session.cached_frame()
-            if frame is not None:
-                fh, fw = frame.shape[:2]
-                card_h = max(350, vp_h - 140)
-                preview_h = card_h - 220
-                preview_w = int(preview_h * fw / fh) if fh > 0 else 400
-                max_preview_w = min(500, vp_w - 80)
-                preview_w = min(preview_w, max_preview_w)
-                card_w = preview_w + 40
-                card_w = max(card_w, 320)
-            else:
-                card_w = 400
-                card_h = 600
-
-            self._cards[serial].refresh(card_w, card_h)
+            self._cards[serial].refresh(CARD_WIDTH, card_h)
 
     def _on_scan(self) -> None:
         if self._manager:

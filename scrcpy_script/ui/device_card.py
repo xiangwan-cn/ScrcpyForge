@@ -56,30 +56,37 @@ class DeviceCard:
         )
         self._texture_tag = placeholder_tag
 
-        with dpg.child_window(parent=parent, tag=tag, width=400, height=600,
+        with dpg.child_window(parent=parent, tag=tag, width=370, height=500,
                               border=True):
-            dpg.add_text(tag=f"{tag}_label",
+            dpg.add_text(tag=f"{tag}_header",
                          default_value=f"{serial} — {self._session.device_name()} [{conn_type}]")
-            dpg.add_text(tag=f"{tag}_status", default_value=f"Disconnected [{conn_type}]")
+            dpg.add_text(tag=f"{tag}_status", default_value="")
 
-            dpg.add_image(placeholder_tag, tag=f"{tag}_preview",
-                          width=360, height=270)
-
-            dpg.add_combo(
-                items=self._script_modules, tag=f"{tag}_script",
-                default_value="",
-                label="Script", width=150,
-            )
             with dpg.group(horizontal=True):
+                dpg.add_spacer(width=0, tag=f"{tag}_pad_l")
+                dpg.add_image(placeholder_tag, tag=f"{tag}_preview",
+                              width=330, height=200)
+                dpg.add_spacer(width=0, tag=f"{tag}_pad_r")
+
+            dpg.add_spacer(height=2)
+            dpg.add_separator()
+            dpg.add_spacer(height=2)
+
+            with dpg.group(horizontal=True):
+                dpg.add_combo(
+                    items=self._script_modules, tag=f"{tag}_script",
+                    default_value="",
+                    label="", width=120,
+                )
                 dpg.add_button(label="Run", callback=lambda: self._on_run(),
                                tag=f"{tag}_run")
                 dpg.add_button(label="Stop", callback=lambda: self._on_stop(),
                                tag=f"{tag}_stop", show=False)
-                dpg.add_button(label="Screenshot", callback=lambda: self._on_screenshot(),
+                dpg.add_button(label="Shot", callback=lambda: self._on_screenshot(),
                                tag=f"{tag}_shot")
                 dpg.add_button(label="Screen", callback=lambda: self._on_toggle_screen(),
                                tag=f"{tag}_screen")
-                dpg.add_button(label="Open scrcpy", callback=lambda: self._on_open_scrcpy(),
+                dpg.add_button(label="scrcpy", callback=lambda: self._on_open_scrcpy(),
                                tag=f"{tag}_scrcpy")
 
             self._log_panel = LogPanel(tag=f"{tag}_logpanel")
@@ -160,30 +167,23 @@ class DeviceCard:
     def _on_toggle_screen(self) -> None:
         self._session.toggle_screen()
 
-    def _on_toggle_screen(self) -> None:
-        self._session.toggle_screen()
-
     def _on_screenshot(self) -> None:
         import scrcpy_script.ui.region_picker as rp
         picker = rp.new_picker(self._session, templates_dir="templates")
         picker.freeze()
 
-    def refresh(self, card_width: int = 400, card_height: int = 600) -> None:
+    def refresh(self, card_width: int = 370, card_height: int = 600) -> None:
         session = self._session
         serial = session.serial()
         tag = f"card_{serial}"
 
-        # Resize card
         dpg.configure_item(tag, width=card_width, height=card_height)
-        preview_w = card_width - 40
-        preview_h = card_height - 220  # space for title, buttons, log
 
-        status = f"Connected  {session.fps:.0f} FPS" if session.is_connected else "Disconnected"
+        status = f"● {session.fps:.0f} FPS" if session.is_connected else "○ Disconnected"
         conn_type = "TCP" if ":" in serial else "USB"
         if dpg.does_item_exist(f"{tag}_status"):
-            dpg.set_value(f"{tag}_status", f"{status} [{conn_type}]")
+            dpg.set_value(f"{tag}_status", f"{status}  [{conn_type}]")
 
-        # Sync run/stop button state with actual script state
         running = self._runner is not None and self._runner.is_running
         if dpg.does_item_exist(f"{tag}_run"):
             dpg.configure_item(f"{tag}_run", show=not running)
@@ -192,7 +192,11 @@ class DeviceCard:
 
         frame = session.get_frame()
         if frame is not None:
-            self._render_frame(frame, serial, preview_w, preview_h)
+            fh, fw = frame.shape[:2]
+            preview_max_w = max(100, card_width - 40)
+            overhead = 210 if fw < fh else 190  # portrait gets 20px less
+            preview_max_h = max(100, card_height - overhead)
+            self._render_frame(frame, serial, preview_max_w, preview_max_h)
 
         if not session.is_connected and self._runner and self._runner.is_running:
             self._on_stop()
@@ -214,8 +218,12 @@ class DeviceCard:
         data = np.ascontiguousarray(frame[:, :, ::-1]).ravel()
         data = (data / 255.0).astype(np.float32)
 
+        def _center():
+            pad = max(0, (max_w - dw) // 2)
+            dpg.configure_item(f"{tag}_pad_l", width=pad)
+            dpg.configure_item(f"{tag}_pad_r", width=pad)
+
         if not self._tex_created:
-            # First frame (or after rotation): create texture with correct dimensions
             old_tag = self._texture_tag
             new_tag = f"tex_{serial}_{self._tex_counter}"
             self._tex_counter += 1
@@ -230,8 +238,8 @@ class DeviceCard:
             self._texture_tag = new_tag
             self._tex_created = True
             self._tex_size = (w, h)
+            _center()
         elif (w, h) != self._tex_size:
-            # Dimensions changed (rotation): must recreate texture
             self._tex_created = False
             self._tex_size = (w, h)
             old_tag = self._texture_tag
@@ -247,9 +255,10 @@ class DeviceCard:
                 dpg.delete_item(old_tag)
             self._texture_tag = new_tag
             self._tex_created = True
+            _center()
         else:
-            # Same dimensions: just update data
             dpg.set_value(self._texture_tag, data)
+            _center()
 
     def _start_watcher(self) -> None:
         if not _has_watchdog:

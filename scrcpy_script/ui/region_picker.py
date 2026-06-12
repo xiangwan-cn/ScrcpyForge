@@ -63,19 +63,19 @@ class RegionPicker:
         if self._frozen_frame is None or not dpg.does_item_exist(self._drawlist_tag):
             return
 
-        # Check window resize
         win_rect = dpg.get_item_rect_size(self._win_tag)
         win_w, win_h = win_rect[0], win_rect[1]
         if win_w > 0 and win_h > 0 and (win_w != self._last_win_w or win_h != self._last_win_h):
             self._last_win_w = win_w
             self._last_win_h = win_h
-            max_w = max(300, win_w - 30)
-            max_h = max(200, win_h - 160)
+            controls_h = 120
+            max_w = max(100, win_w - 30)
+            max_h = max(100, win_h - controls_h)
             scale = min(max_w / self._fw, max_h / self._fh)
             self._dw = int(self._fw * scale)
             self._dh = int(self._fh * scale)
             dpg.configure_item(self._drawlist_tag, width=self._dw, height=self._dh)
-            self._sel_start = None  # reset selection on resize
+            self._sel_start = None
             self._redraw_image()
 
         if self._sel_start is None:
@@ -149,39 +149,43 @@ class RegionPicker:
 
         vp_w = dpg.get_viewport_width()
         vp_h = dpg.get_viewport_height()
-        win_w = max(520, min(vp_w - 40, 700))
-        win_h = max(500, min(vp_h - 60, 750))
+        self._fh, self._fw = self._frozen_frame.shape[:2]
+
+        controls_h = 110
+        max_img_w = vp_w - 100
+        max_img_h = vp_h - 160
+        scale = min(max_img_w / self._fw, max_img_h / self._fh, 1.0)
+        self._dw = int(self._fw * scale)
+        self._dh = int(self._fh * scale)
+        win_w = self._dw + 30
+        win_h = self._dh + controls_h
+
+        pos_x = max(0, (vp_w - win_w) // 2)
+        pos_y = max(0, (vp_h - win_h) // 2)
+
+        data = np.ascontiguousarray(self._frozen_frame[:, :, ::-1]).ravel()
+        data = (data / 255.0).astype(np.float32)
 
         with dpg.window(
             label=f"Snapshot — {self._session.serial()}",
             width=win_w, height=win_h,
-            tag=self._win_tag,
+            tag=self._win_tag, pos=[pos_x, pos_y],
             on_close=self.unfreeze,
+            no_collapse=True, modal=True,
         ):
-            if self._frozen_frame is not None:
-                self._fh, self._fw = self._frozen_frame.shape[:2]
-                max_w = max(300, win_w - 40)
-                max_h = max(200, win_h - 160)
-                scale = min(max_w / self._fw, max_h / self._fh)
-                self._dw = int(self._fw * scale)
-                self._dh = int(self._fh * scale)
+            with dpg.texture_registry(tag=self._tex_reg):
+                dpg.add_raw_texture(
+                    width=self._fw, height=self._fh, default_value=data,
+                    tag=self._tex_tag, format=dpg.mvFormat_Float_rgb,
+                )
+            with dpg.drawlist(width=self._dw, height=self._dh, tag=self._drawlist_tag):
+                dpg.draw_image(self._tex_tag, (0, 0), (self._dw, self._dh),
+                               uv_min=(0, 0), uv_max=(1, 1))
 
-                data = np.ascontiguousarray(self._frozen_frame[:, :, ::-1]).ravel()
-                data = (data / 255.0).astype(np.float32)
-
-                with dpg.texture_registry(tag=self._tex_reg):
-                    dpg.add_raw_texture(
-                        width=self._fw, height=self._fh, default_value=data,
-                        tag=self._tex_tag, format=dpg.mvFormat_Float_rgb,
-                    )
-                with dpg.drawlist(width=self._dw, height=self._dh, tag=self._drawlist_tag):
-                    dpg.draw_image(self._tex_tag, (0, 0), (self._dw, self._dh),
-                                   uv_min=(0, 0), uv_max=(1, 1))
-
-            dpg.add_text(tag=self._coord_tag,
-                         default_value="Hold left mouse button and drag on image to select region")
-            dpg.add_input_text(label="Name", tag=self._name_tag, default_value="template")
+            dpg.add_text(tag=self._coord_tag, default_value="")
             with dpg.group(horizontal=True):
+                dpg.add_input_text(label="", tag=self._name_tag,
+                                   default_value="template", width=110)
                 dpg.add_button(label="Save Full", callback=self._on_save_full)
                 dpg.add_button(label="Close", callback=self.unfreeze)
 
