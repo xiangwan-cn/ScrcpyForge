@@ -7,3 +7,4 @@ dist/
 win/
 .worktrees/
 templates/example_start.png
+last_scripts.json

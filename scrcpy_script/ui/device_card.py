@@ -23,19 +23,21 @@ except ImportError:
 
 
 class DeviceCard:
-    def __init__(self, session, scripts_dir: str = "scripts") -> None:
+    def __init__(self, session, scripts_dir: str = "scripts",
+                 last_script: str = "") -> None:
         self._session = session
         self._scripts_dir = scripts_dir
         self._runner: Optional[ScriptRunner] = None
         self._script_modules: list[str] = []
-        self._current_script: str = ""
+        self._current_script: str = last_script
         self._texture_tag = ""
         self._tex_created = False
         self._tex_size = (0, 0)
-        self._tex_counter = 2  # start at 2 (0=placeholder, 1=first real frame)
+        self._tex_counter = 2
         self._log_panel: Optional[LogPanel] = None
         self._api: Optional[ScriptAPI] = None
         self._observer = None
+        self._on_script_run = None
         self._refresh_scripts()
         self._start_watcher()
 
@@ -75,7 +77,7 @@ class DeviceCard:
             with dpg.group(horizontal=True):
                 dpg.add_combo(
                     items=self._script_modules, tag=f"{tag}_script",
-                    default_value="",
+                    default_value=self._current_script,
                     label="", width=120,
                 )
                 dpg.add_button(label="Run", callback=lambda: self._on_run(),
@@ -84,12 +86,15 @@ class DeviceCard:
                                tag=f"{tag}_stop", show=False)
                 dpg.add_button(label="Shot", callback=lambda: self._on_screenshot(),
                                tag=f"{tag}_shot")
-                dpg.add_button(label="Screen", callback=lambda: self._on_toggle_screen(),
+                dpg.add_button(label="Screen Off", callback=lambda: self._on_toggle_screen(),
                                tag=f"{tag}_screen")
                 dpg.add_button(label="scrcpy", callback=lambda: self._on_open_scrcpy(),
                                tag=f"{tag}_scrcpy")
 
             self._log_panel = LogPanel(tag=f"{tag}_logpanel")
+
+    def set_script_run_callback(self, cb) -> None:
+        self._on_script_run = cb
 
     def _refresh_scripts(self) -> None:
         self._script_modules = []
@@ -141,6 +146,9 @@ class DeviceCard:
         if mod is None:
             self._session.log(f"[ERROR] Script not found: {script_name}")
             return
+        self._current_script = script_name
+        if self._on_script_run:
+            self._on_script_run(script_name)
         self._runner = ScriptRunner(None)
         self._api = ScriptAPI(self._session, self._runner.stop_event)
         self._runner.set_api(self._api)
@@ -189,6 +197,9 @@ class DeviceCard:
             dpg.configure_item(f"{tag}_run", show=not running)
         if dpg.does_item_exist(f"{tag}_stop"):
             dpg.configure_item(f"{tag}_stop", show=running)
+        if dpg.does_item_exist(f"{tag}_screen"):
+            dpg.configure_item(f"{tag}_screen",
+                               label="Screen Off" if session.is_screen_on else "Screen On")
 
         frame = session.get_frame()
         if frame is not None:

@@ -1,4 +1,6 @@
 """DearPyGui main application window."""
+import json
+from pathlib import Path
 from typing import Optional
 
 import dearpygui.dearpygui as dpg
@@ -8,6 +10,18 @@ from scrcpy_script.ui.device_card import DeviceCard
 from scrcpy_script.ui import region_picker
 
 CARD_WIDTH = 370
+STATE_FILE = Path("last_scripts.json")
+
+
+def _load_last_scripts() -> dict[str, str]:
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+
+def _save_last_scripts(data: dict[str, str]) -> None:
+    STATE_FILE.write_text(json.dumps(data, indent=2))
 
 # ── dark theme ────────────────────────────────────────
 def _set_dark_theme():
@@ -42,6 +56,7 @@ class UiApp:
         self._cards: dict[str, DeviceCard] = {}
         self._running = False
         self._scripts_dir = "scripts"
+        self._last_scripts: dict[str, str] = _load_last_scripts()
 
     def init(self, device_manager: DeviceManager,
              scripts_dir: str = "scripts") -> None:
@@ -106,7 +121,14 @@ class UiApp:
         for session in sessions:
             serial = session.serial()
             if serial not in self._cards:
-                card = DeviceCard(session, scripts_dir=self._scripts_dir)
+                card = DeviceCard(session, scripts_dir=self._scripts_dir,
+                                  last_script=self._last_scripts.get(serial, ""))
+                card.set_script_run_callback(
+                    lambda name, s=serial: (
+                        self._last_scripts.__setitem__(s, name),
+                        _save_last_scripts(self._last_scripts),
+                    )
+                )
                 card.build("device_grid")
                 self._cards[serial] = card
 

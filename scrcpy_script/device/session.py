@@ -313,5 +313,9 @@ class DeviceSession:
     def is_connected(self) -> bool:
         return self._connected
 
+    @property
+    def is_screen_on(self) -> bool:
+        return getattr(self, "_screen_on", True)
+
     def set_disconnect_callback(self, cb: Callable) -> None:
         self._disconnect_cb = cb
