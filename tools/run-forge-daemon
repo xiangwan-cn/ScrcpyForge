@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+opencv_lib="$root/third_party/opencv-root/usr/lib"
+export LD_LIBRARY_PATH="$opencv_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$root/target/release/forge-daemon" "$@"

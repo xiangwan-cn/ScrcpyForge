@@ -1,0 +1,5 @@
+# Scripts are user data. Keep only the portable API example in releases.
+/*
+!/.gitignore
+!/example_all_api/
+!/example_all_api/script.lua

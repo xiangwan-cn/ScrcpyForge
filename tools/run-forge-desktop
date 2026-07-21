@@ -1,0 +1,8 @@
+#!/usr/bin/env sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+api=${SCRCPYFORGE_API:-http://127.0.0.1:27180/api/v1}
+if ! curl --silent --fail --max-time 1 "$api/health" >/dev/null 2>&1; then
+    "$root/tools/run-forge-daemon" >>"${XDG_RUNTIME_DIR:-/tmp}/scrcpyforge-daemon.log" 2>&1 &
+fi
+exec "$root/target/release/forge-desktop" "$@"

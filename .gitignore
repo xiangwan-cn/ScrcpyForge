@@ -1,0 +1,7 @@
+/target/
+/third_party/
+.env
+*.log
+*.swp
+.idea/
+.vscode/
