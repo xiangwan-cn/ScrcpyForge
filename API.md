@@ -72,6 +72,33 @@ array.
 {"endpoint":"192.168.1.10:5555"}
 ```
 
+### `GET /devices/pairing-services`
+
+Discovers Android wireless-debugging pairing services advertised as
+`_adb-tls-pairing._tcp`. The response can be empty when mDNS is unavailable;
+clients should allow manual entry of the pairing endpoint shown by Android.
+
+```json
+[
+  {"name":"adb-123456","endpoint":"192.168.1.10:37123"}
+]
+```
+
+### `POST /devices/pair`
+
+Pairs with the endpoint shown by Android's “Pair device with pairing code”
+dialog. The code must contain exactly six digits. The daemon sends it to
+`adb pair` over standard input, never as a command-line argument.
+
+```json
+{"endpoint":"192.168.1.10:37123","code":"123456"}
+```
+
+After pairing, the daemon waits for ADB's automatic connection. If necessary,
+it discovers the separate `_adb-tls-connect._tcp` endpoint for the same host,
+connects it, and returns the refreshed device array. Pairing and connection
+ports are not interchangeable.
+
 ### `GET /devices/{serial}/screenshot`
 
 Returns an ADB screenshot as `image/png`. This route does not require a running

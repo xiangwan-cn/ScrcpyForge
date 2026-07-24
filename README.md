@@ -9,7 +9,8 @@ clients use one versioned local REST/WebSocket API.
 
 ## Features
 
-- USB and wireless-ADB discovery, including paired-device mDNS discovery.
+- USB and wireless-ADB discovery, including pairing-code setup and
+  paired-device mDNS discovery.
 - H.264, H.265, and AV1 scrcpy video sessions with latest-frame delivery.
 - Desktop, browser, CLI, and headless API workflows.
 - Per-device Lua automation with native template matching and input control.
@@ -53,10 +54,12 @@ available at `http://127.0.0.1:27180/`.
 ## Typical workflow
 
 1. Start the daemon and scan for devices.
-2. Start a scrcpy session for a selected device.
-3. Choose preview and performance profiles as needed.
-4. Run a named Lua script or submit Lua source through the API.
-5. Observe script logs and lifecycle events over `/api/v1/events`.
+2. For an unpaired device, choose **Wireless pairing** in the browser or
+   desktop client and enter Android's six-digit pairing code.
+3. Start a scrcpy session for a selected device.
+4. Choose preview and performance profiles as needed.
+5. Run a named Lua script or submit Lua source through the API.
+6. Observe script logs and lifecycle events over `/api/v1/events`.
 
 Example session start:
 

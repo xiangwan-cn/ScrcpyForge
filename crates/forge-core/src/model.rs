@@ -20,6 +20,12 @@ pub struct DeviceInfo {
     pub wireless: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PairingService {
+    pub name: String,
+    pub endpoint: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InputAction {

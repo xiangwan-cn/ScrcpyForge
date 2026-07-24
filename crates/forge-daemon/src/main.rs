@@ -51,6 +51,12 @@ struct ConnectRequest {
     endpoint: String,
 }
 
+#[derive(Deserialize)]
+struct PairRequest {
+    endpoint: String,
+    code: String,
+}
+
 #[derive(Serialize)]
 struct RunResponse {
     run_id: Uuid,
@@ -115,6 +121,8 @@ async fn main() -> anyhow::Result<()> {
         .route("/api/v1/devices", get(devices))
         .route("/api/v1/devices/scan", post(scan))
         .route("/api/v1/devices/connect", post(connect))
+        .route("/api/v1/devices/pairing-services", get(pairing_services))
+        .route("/api/v1/devices/pair", post(pair))
         .route("/api/v1/devices/{serial}/screenshot", get(screenshot))
         .route("/api/v1/devices/{serial}/input", post(input))
         .route("/api/v1/sessions/{serial}/start", post(start_session))
@@ -188,7 +196,7 @@ async fn health() -> Json<Health> {
 }
 async fn capabilities() -> Json<serde_json::Value> {
     Json(
-        serde_json::json!({"api_version":1,"scrcpy_server":"4.0","codecs":["h264","h265","av1"],"frame_storage":"i420","vision_modes":["color","gray","multiscale"],"lua":"5.4","preview":["websocket_jpeg","five_seconds","off"],"script_profiles":["auto","eco","balanced","realtime"]}),
+        serde_json::json!({"api_version":1,"scrcpy_server":"4.0","codecs":["h264","h265","av1"],"frame_storage":"i420","vision_modes":["color","gray","multiscale"],"lua":"5.4","preview":["websocket_jpeg","five_seconds","off"],"script_profiles":["auto","eco","balanced","realtime"],"wireless_pairing":true}),
     )
 }
 async fn request_shutdown(State(s): State<AppState>) -> StatusCode {
@@ -209,6 +217,15 @@ async fn connect(
     Json(body): Json<ConnectRequest>,
 ) -> Result<impl IntoResponse, ApiError> {
     Ok(Json(s.manager.connect(&body.endpoint).await?))
+}
+async fn pairing_services(State(s): State<AppState>) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(s.manager.pairing_services().await?))
+}
+async fn pair(
+    State(s): State<AppState>,
+    Json(body): Json<PairRequest>,
+) -> Result<impl IntoResponse, ApiError> {
+    Ok(Json(s.manager.pair(&body.endpoint, &body.code).await?))
 }
 async fn screenshot(
     State(s): State<AppState>,

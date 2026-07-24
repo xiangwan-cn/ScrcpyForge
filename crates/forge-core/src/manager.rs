@@ -6,7 +6,7 @@ use tokio::sync::{broadcast, RwLock};
 use crate::{
     adb::Adb,
     session::{ScrcpySession, SessionOptions},
-    DeviceInfo, ForgeEvent, InputAction,
+    DeviceInfo, DeviceState, ForgeEvent, InputAction, PairingService,
 };
 
 #[derive(Clone)]
@@ -128,6 +128,39 @@ impl DeviceManager {
         self.scan(false).await
     }
 
+    pub async fn pairing_services(&self) -> Result<Vec<PairingService>> {
+        self.adb.pairing_services().await
+    }
+
+    pub async fn pair(&self, endpoint: &str, code: &str) -> Result<Vec<DeviceInfo>> {
+        self.adb.pair(endpoint, code).await?;
+        let host = endpoint_host(endpoint);
+
+        // Modern adb normally connects immediately after a successful pairing.
+        // Give that asynchronous registration a short window before resolving
+        // the separate TLS connection service ourselves.
+        for _ in 0..4 {
+            let devices = self.adb.devices().await?;
+            if devices.iter().any(|device| {
+                device.wireless
+                    && matches!(device.state, DeviceState::Device)
+                    && endpoint_host(&device.serial) == host
+            }) {
+                return self.scan(false).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
+        for connect_endpoint in self.adb.mdns_endpoints().await.unwrap_or_default() {
+            if endpoint_host(&connect_endpoint) == host
+                && self.adb.connect(&connect_endpoint).await.is_ok()
+            {
+                break;
+            }
+        }
+        self.scan(false).await
+    }
+
     pub async fn input(&self, serial: &str, action: &InputAction) -> Result<()> {
         self.adb.input(serial, action).await
     }
@@ -136,5 +169,33 @@ impl DeviceManager {
 impl Default for DeviceManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn endpoint_host(endpoint: &str) -> String {
+    if let Ok(address) = endpoint.parse::<std::net::SocketAddr>() {
+        return address.ip().to_string();
+    }
+    if let Some(rest) = endpoint.strip_prefix('[') {
+        return rest
+            .split_once(']')
+            .map(|(host, _)| host.to_owned())
+            .unwrap_or_else(|| endpoint.to_owned());
+    }
+    endpoint
+        .rsplit_once(':')
+        .map(|(host, _)| host.to_owned())
+        .unwrap_or_else(|| endpoint.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_host;
+
+    #[test]
+    fn extracts_endpoint_hosts() {
+        assert_eq!(endpoint_host("192.168.1.2:37001"), "192.168.1.2");
+        assert_eq!(endpoint_host("[fe80::1]:37001"), "fe80::1");
+        assert_eq!(endpoint_host("phone.local:37001"), "phone.local");
     }
 }

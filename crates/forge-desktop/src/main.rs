@@ -20,6 +20,11 @@ struct Device {
     wireless: bool,
 }
 #[derive(Clone, Deserialize)]
+struct PairingService {
+    name: String,
+    endpoint: String,
+}
+#[derive(Clone, Deserialize)]
 struct ScriptRun {
     run_id: String,
     serial: String,
@@ -64,6 +69,8 @@ impl Mode {
 enum Command {
     Refresh,
     Connect(String),
+    DiscoverPairingServices,
+    Pair(String, String),
     StartSession(String),
     StopSession(String),
     StartAll,
@@ -78,6 +85,8 @@ enum Command {
 }
 enum Event {
     Devices(Vec<Device>),
+    PairingServices(Result<Vec<PairingService>, String>),
+    PairingFinished(Result<(), String>),
     Scripts(Vec<String>),
     Runs(Vec<ScriptRun>),
     Sessions(Vec<String>),
@@ -103,6 +112,12 @@ struct App {
     paths: HashMap<String, String>,
     drag_starts: HashMap<String, egui::Pos2>,
     endpoint: String,
+    pairing_open: bool,
+    pairing_endpoint: String,
+    pairing_code: String,
+    pairing_services: Vec<PairingService>,
+    pairing_status: String,
+    pairing_busy: bool,
     status: String,
     last_tick: Instant,
 }
@@ -129,6 +144,12 @@ impl App {
             paths: HashMap::new(),
             drag_starts: HashMap::new(),
             endpoint: String::new(),
+            pairing_open: false,
+            pairing_endpoint: String::new(),
+            pairing_code: String::new(),
+            pairing_services: vec![],
+            pairing_status: String::new(),
+            pairing_busy: false,
             status: "正在连接后端…".into(),
             last_tick: Instant::now(),
         }
@@ -137,6 +158,36 @@ impl App {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 Event::Devices(v) => self.devices = v,
+                Event::PairingServices(result) => match result {
+                    Ok(services) => {
+                        self.pairing_services = services;
+                        if let Some(service) = self.pairing_services.first() {
+                            self.pairing_endpoint = service.endpoint.clone();
+                            self.pairing_status =
+                                format!("发现 {} 个配对服务", self.pairing_services.len());
+                        } else {
+                            self.pairing_status = "未自动发现设备，请手动输入手机显示的地址".into();
+                        }
+                    }
+                    Err(error) => {
+                        self.pairing_services.clear();
+                        self.pairing_status = format!("搜索失败：{error}");
+                    }
+                },
+                Event::PairingFinished(result) => {
+                    self.pairing_busy = false;
+                    self.pairing_code.clear();
+                    match result {
+                        Ok(()) => {
+                            self.pairing_open = false;
+                            self.status = "无线调试配对成功".into();
+                            let _ = self.commands.send(Command::Refresh);
+                        }
+                        Err(error) => {
+                            self.pairing_status = format!("配对失败：{error}");
+                        }
+                    }
+                }
                 Event::Scripts(v) => self.scripts = v,
                 Event::Runs(v) => {
                     self.runs = v
@@ -184,7 +235,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &Context, _: &mut eframe::Frame) {
         self.receive(ctx);
-        if self.last_tick.elapsed() > Duration::from_secs(2) {
+        if !self.pairing_busy && self.last_tick.elapsed() > Duration::from_secs(2) {
             let _ = self.commands.send(Command::Refresh);
             self.last_tick = Instant::now();
         }
@@ -221,9 +272,116 @@ impl eframe::App for App {
                         .commands
                         .send(Command::Connect(self.endpoint.trim().to_owned()));
                 }
+                if ui.button("无线配对").clicked() {
+                    self.pairing_open = true;
+                    self.pairing_code.clear();
+                    self.pairing_status = "正在搜索附近的配对服务…".into();
+                    let _ = self.commands.send(Command::DiscoverPairingServices);
+                }
             });
             ui.add_space(6.0);
         });
+        if self.pairing_open {
+            self.pairing_code
+                .retain(|character| character.is_ascii_digit());
+            self.pairing_code.truncate(self.pairing_code.len().min(6));
+            let mut open = self.pairing_open;
+            egui::Window::new("无线调试配对")
+                .open(&mut open)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(420.0)
+                .show(ctx, |ui| {
+                    ui.label("先在 Android 的“无线调试”中选择“使用配对码配对设备”。");
+                    ui.small("配对端口与连接端口通常不同，成功后会自动查找连接端口。");
+                    ui.add_space(8.0);
+                    ui.label("发现的配对服务");
+                    let selected = self
+                        .pairing_services
+                        .iter()
+                        .find(|service| service.endpoint == self.pairing_endpoint)
+                        .map(|service| format!("{} · {}", service.name, service.endpoint))
+                        .unwrap_or_else(|| "手动输入配对地址".into());
+                    egui::ComboBox::from_id_salt("pairing-service")
+                        .selected_text(selected)
+                        .width(390.0)
+                        .show_ui(ui, |ui| {
+                            for service in self.pairing_services.clone() {
+                                let label = format!("{} · {}", service.name, service.endpoint);
+                                if ui
+                                    .selectable_label(
+                                        self.pairing_endpoint == service.endpoint,
+                                        label,
+                                    )
+                                    .clicked()
+                                {
+                                    self.pairing_endpoint = service.endpoint;
+                                }
+                            }
+                        });
+                    if ui
+                        .add_enabled(!self.pairing_busy, egui::Button::new("重新搜索"))
+                        .clicked()
+                    {
+                        self.pairing_status = "正在搜索附近的配对服务…".into();
+                        let _ = self.commands.send(Command::DiscoverPairingServices);
+                    }
+                    ui.add_space(6.0);
+                    ui.label("配对地址");
+                    ui.add_enabled(
+                        !self.pairing_busy,
+                        egui::TextEdit::singleline(&mut self.pairing_endpoint)
+                            .hint_text("192.168.1.10:配对端口")
+                            .desired_width(390.0),
+                    );
+                    ui.label("六位配对码");
+                    ui.add_enabled(
+                        !self.pairing_busy,
+                        egui::TextEdit::singleline(&mut self.pairing_code)
+                            .password(true)
+                            .char_limit(6)
+                            .hint_text("000000")
+                            .desired_width(180.0),
+                    );
+                    if !self.pairing_status.is_empty() {
+                        ui.small(&self.pairing_status);
+                    }
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let valid = !self.pairing_busy
+                            && endpoint_looks_valid(self.pairing_endpoint.trim())
+                            && self.pairing_code.len() == 6;
+                        if ui
+                            .add_enabled(
+                                valid,
+                                egui::Button::new(if self.pairing_busy {
+                                    "正在配对…"
+                                } else {
+                                    "配对"
+                                }),
+                            )
+                            .clicked()
+                        {
+                            let endpoint = self.pairing_endpoint.trim().to_owned();
+                            let code = std::mem::take(&mut self.pairing_code);
+                            self.pairing_busy = true;
+                            self.pairing_status = "正在配对并查找连接端口…".into();
+                            let _ = self.commands.send(Command::Pair(endpoint, code));
+                        }
+                        if ui
+                            .add_enabled(!self.pairing_busy, egui::Button::new("取消"))
+                            .clicked()
+                        {
+                            self.pairing_code.clear();
+                            self.pairing_open = false;
+                        }
+                    });
+                });
+            if !open {
+                self.pairing_code.clear();
+            }
+            self.pairing_open &= open;
+        }
         egui::CentralPanel::default().show(ctx,|ui|{egui::ScrollArea::vertical().show(ui,|ui|{if self.devices.is_empty(){ui.vertical_centered(|ui|{ui.add_space(80.0);ui.heading("未发现设备");ui.label("请连接 USB 或无线 ADB 设备");});return;}
    let columns=if ui.available_width()<620.0{1}else if ui.available_width()<980.0{2}else{3};let width=(ui.available_width()-12.0*(columns-1)as f32)/columns as f32;
    for row in self.devices.chunks(columns){ui.horizontal_top(|ui|{for device in row{let serial=&device.serial;let session_running=self.sessions.contains(serial);let run=self.runs.get(serial);
@@ -297,6 +455,19 @@ fn default_template_name(serial: &str) -> String {
             .collect::<String>()
     )
 }
+fn endpoint_looks_valid(endpoint: &str) -> bool {
+    let parts = if let Some(rest) = endpoint.strip_prefix('[') {
+        rest.split_once(']')
+            .and_then(|(host, suffix)| suffix.strip_prefix(':').map(|port| (host, port)))
+    } else {
+        endpoint.rsplit_once(':')
+    };
+    parts.is_some_and(|(host, port)| {
+        !host.is_empty()
+            && !host.chars().any(char::is_whitespace)
+            && port.parse::<u16>().is_ok_and(|value| value > 0)
+    })
+}
 fn spawn_backend(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>, ctx: Context) {
     thread::spawn(move || {
         let api = std::env::var("SCRCPYFORGE_API").unwrap_or_else(|_| DEFAULT_API.into());
@@ -361,6 +532,31 @@ fn spawn_backend(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>,
                         Ok(()) => format!("已连接 {endpoint}"),
                         Err(e) => format!("连接失败：{e}"),
                     }));
+                }
+                Ok(Command::DiscoverPairingServices) => {
+                    let result = get::<Vec<PairingService>>(
+                        &client,
+                        &format!("{api}/devices/pairing-services"),
+                    )
+                    .map_err(|error| error.to_string());
+                    let _ = events.send(Event::PairingServices(result));
+                }
+                Ok(Command::Pair(endpoint, code)) => {
+                    let result = client
+                        .post(format!("{api}/devices/pair"))
+                        .json(&serde_json::json!({"endpoint":endpoint,"code":code}))
+                        .send()
+                        .and_then(|response| response.error_for_status())
+                        .and_then(|response| response.json::<Vec<Device>>());
+                    match result {
+                        Ok(devices) => {
+                            let _ = events.send(Event::Devices(devices));
+                            let _ = events.send(Event::PairingFinished(Ok(())));
+                        }
+                        Err(error) => {
+                            let _ = events.send(Event::PairingFinished(Err(error.to_string())));
+                        }
+                    }
                 }
                 Ok(Command::SetScriptProfile(serial, profile)) => {
                     let result = post(
@@ -591,4 +787,17 @@ fn main() -> eframe::Result {
         options,
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint_looks_valid;
+
+    #[test]
+    fn validates_pairing_endpoints() {
+        assert!(endpoint_looks_valid("192.168.1.2:37123"));
+        assert!(endpoint_looks_valid("[fe80::1]:37123"));
+        assert!(!endpoint_looks_valid("192.168.1.2"));
+        assert!(!endpoint_looks_valid("192.168.1.2:0"));
+    }
 }
