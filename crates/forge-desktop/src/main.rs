@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc,
+        mpsc, Arc, Mutex,
     },
     thread,
     time::{Duration, Instant},
@@ -91,14 +91,23 @@ enum Event {
     Runs(Vec<ScriptRun>),
     Sessions(Vec<String>),
     Metrics(HashMap<String, Metrics>),
-    Frame(String, Vec<u8>),
     Saved(String, String),
     Status(String),
+}
+
+type LatestFrames = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+fn store_latest_frame(latest_frames: &LatestFrames, serial: String, bytes: Vec<u8>) {
+    latest_frames
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(serial, bytes);
 }
 
 struct App {
     commands: mpsc::Sender<Command>,
     events: mpsc::Receiver<Event>,
+    latest_frames: LatestFrames,
     devices: Vec<Device>,
     scripts: Vec<String>,
     runs: HashMap<String, ScriptRun>,
@@ -126,11 +135,13 @@ impl App {
         configure(&cc.egui_ctx);
         let (commands, rx) = mpsc::channel();
         let (tx, events) = mpsc::channel();
-        spawn_backend(rx, tx, cc.egui_ctx.clone());
+        let latest_frames = LatestFrames::default();
+        spawn_backend(rx, tx, latest_frames.clone(), cc.egui_ctx.clone());
         let _ = commands.send(Command::Refresh);
         Self {
             commands,
             events,
+            latest_frames,
             devices: vec![],
             scripts: vec![],
             runs: HashMap::new(),
@@ -200,31 +211,40 @@ impl App {
                     for serial in &v {
                         self.modes.entry(serial.clone()).or_insert(Mode::Realtime);
                     }
-                    self.sessions = v.into_iter().collect()
+                    self.sessions = v.into_iter().collect();
+                    self.textures
+                        .retain(|serial, _| self.sessions.contains(serial));
                 }
                 Event::Metrics(v) => self.metrics = v,
                 Event::Status(v) => self.status = v,
-                Event::Frame(serial, bytes) => {
-                    if let Ok(img) = image::load_from_memory(&bytes) {
-                        let rgba = img.to_rgba8();
-                        let size = [rgba.width() as usize, rgba.height() as usize];
-                        let color = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                        if let Some(texture) = self.textures.get_mut(&serial) {
-                            texture.set(color, egui::TextureOptions::LINEAR)
-                        } else {
-                            self.textures.insert(
-                                serial.clone(),
-                                ctx.load_texture(
-                                    format!("device-{serial}"),
-                                    color,
-                                    egui::TextureOptions::LINEAR,
-                                ),
-                            );
-                        }
-                    }
-                }
                 Event::Saved(serial, path) => {
                     self.status = format!("{serial} 模板已保存：{path}");
+                }
+            }
+        }
+        let frames = {
+            let mut latest = self
+                .latest_frames
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::take(&mut *latest)
+        };
+        for (serial, bytes) in frames {
+            if let Ok(img) = image::load_from_memory(&bytes) {
+                let rgba = img.to_rgba8();
+                let size = [rgba.width() as usize, rgba.height() as usize];
+                let color = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
+                if let Some(texture) = self.textures.get_mut(&serial) {
+                    texture.set(color, egui::TextureOptions::LINEAR)
+                } else {
+                    self.textures.insert(
+                        serial.clone(),
+                        ctx.load_texture(
+                            format!("device-{serial}"),
+                            color,
+                            egui::TextureOptions::LINEAR,
+                        ),
+                    );
                 }
             }
         }
@@ -468,7 +488,12 @@ fn endpoint_looks_valid(endpoint: &str) -> bool {
             && port.parse::<u16>().is_ok_and(|value| value > 0)
     })
 }
-fn spawn_backend(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>, ctx: Context) {
+fn spawn_backend(
+    commands: mpsc::Receiver<Command>,
+    events: mpsc::Sender<Event>,
+    latest_frames: LatestFrames,
+    ctx: Context,
+) {
     thread::spawn(move || {
         let api = std::env::var("SCRCPYFORGE_API").unwrap_or_else(|_| DEFAULT_API.into());
         let client = reqwest::blocking::Client::builder()
@@ -494,6 +519,10 @@ fn spawn_backend(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>,
                                 ));
                             }
                             modes.retain(|serial, _| se.contains(serial));
+                            latest_frames
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .retain(|serial, _| se.contains(serial));
                             let metrics: HashMap<_, _> = se
                                 .iter()
                                 .filter_map(|serial| {
@@ -604,6 +633,10 @@ fn spawn_backend(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>,
                     if let Some(token) = streams.remove(&serial) {
                         token.store(false, Ordering::Relaxed);
                     }
+                    latest_frames
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&serial);
                 }
                 Ok(Command::StartAll) => {
                     let _ = client.post(format!("{api}/sessions/start-all")).send();
@@ -614,6 +647,10 @@ fn spawn_backend(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>,
                     for (_, token) in streams.drain() {
                         token.store(false, Ordering::Relaxed);
                     }
+                    latest_frames
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .clear();
                 }
                 Ok(Command::StopAllScripts) => {
                     let _ = client.post(format!("{api}/scripts/stop-all")).send();
@@ -666,6 +703,10 @@ fn spawn_backend(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>,
                         if let Some(token) = streams.remove(&serial) {
                             token.store(false, Ordering::Relaxed);
                         }
+                        latest_frames
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .remove(&serial);
                     }
                     modes.insert(serial, (mode, Instant::now() - Duration::from_secs(10)));
                 }
@@ -684,7 +725,7 @@ fn spawn_backend(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>,
                     spawn_preview_ws(
                         api.clone(),
                         serial.clone(),
-                        events.clone(),
+                        latest_frames.clone(),
                         token.clone(),
                         ctx.clone(),
                     );
@@ -701,7 +742,7 @@ fn spawn_backend(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>,
                         .and_then(|r| r.error_for_status())
                         .and_then(|r| r.bytes())
                     {
-                        let _ = events.send(Event::Frame(serial.clone(), bytes.to_vec()));
+                        store_latest_frame(&latest_frames, serial.clone(), bytes.to_vec());
                         ctx.request_repaint();
                     }
                     *last = Instant::now();
@@ -713,7 +754,7 @@ fn spawn_backend(commands: mpsc::Receiver<Command>, events: mpsc::Sender<Event>,
 fn spawn_preview_ws(
     api: String,
     serial: String,
-    events: mpsc::Sender<Event>,
+    latest_frames: LatestFrames,
     running: Arc<AtomicBool>,
     ctx: Context,
 ) {
@@ -733,8 +774,11 @@ fn spawn_preview_ws(
             while running.load(Ordering::Relaxed) {
                 match socket.read() {
                     Ok(message) if message.is_binary() => {
-                        let _ =
-                            events.send(Event::Frame(serial.clone(), message.into_data().to_vec()));
+                        store_latest_frame(
+                            &latest_frames,
+                            serial.clone(),
+                            message.into_data().to_vec(),
+                        );
                         ctx.request_repaint();
                     }
                     Ok(_) => {}
@@ -791,7 +835,7 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::endpoint_looks_valid;
+    use super::{endpoint_looks_valid, store_latest_frame, LatestFrames};
 
     #[test]
     fn validates_pairing_endpoints() {
@@ -799,5 +843,18 @@ mod tests {
         assert!(endpoint_looks_valid("[fe80::1]:37123"));
         assert!(!endpoint_looks_valid("192.168.1.2"));
         assert!(!endpoint_looks_valid("192.168.1.2:0"));
+    }
+
+    #[test]
+    fn keeps_only_latest_frame_per_device() {
+        let frames = LatestFrames::default();
+        store_latest_frame(&frames, "device-1".into(), vec![1]);
+        store_latest_frame(&frames, "device-1".into(), vec![2]);
+        store_latest_frame(&frames, "device-2".into(), vec![3]);
+
+        let frames = frames.lock().unwrap();
+        assert_eq!(frames.len(), 2);
+        assert_eq!(frames["device-1"], vec![2]);
+        assert_eq!(frames["device-2"], vec![3]);
     }
 }
