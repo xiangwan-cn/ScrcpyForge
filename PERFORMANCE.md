@@ -17,3 +17,18 @@ For a reproducible recognition ceiling test:
 Production scripts should normally use the `auto` profile. Prefer ROI tracking
 when the workflow permits it, and enable preview only when an operator needs it;
 preview JPEG encoding is intentionally independent from script processing.
+
+The runtime exposes `SCRCPYFORGE_CV_THREADS` and
+`SCRCPYFORGE_DECODE_THREADS`/`SCRCPYFORGE_DECODE_THREAD_TYPE` so a multi-device
+host can keep OpenCV and FFmpeg within one CPU budget. `SCRCPYFORGE_ADB_TIMEOUT_MS`
+puts a bound on control-plane subprocesses. `/api/v1/state` returns session
+metrics in one snapshot; compare `latest_frame_age_ms`, `last_publish_us`,
+`script_rescans`, `input_failures`, and video error counters before tuning a
+matching threshold.
+
+For tracking A/B runs, compare full-screen matching with tracking enabled on the
+same captured frames. Include a static screen after script attach, a target move
+of 10/50/150 pixels, a two-frame local miss, a geometry change, and a target
+that remains visible after a tap. Accept the ROI path only when true hits and
+false taps are no worse than the full-screen baseline and the recovery counters
+show the expected local → expanded → full sequence.

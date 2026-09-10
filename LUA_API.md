@@ -55,24 +55,41 @@ forge.vision {
 - `"none"` 或 Lua 函数
 
 当所有可用目标使用相同阈值、ROI 和单尺度模式时，调度器自动调用一次
-`frame:find_first()`，共享帧颜色转换并按目标顺序返回首个命中。目标覆盖了不同参数、
-处于独立冷却或动态禁用时会回退为按优先级逐项匹配，保证语义正确。
+`frame:find_candidates()`，共享帧颜色转换并为每个模板保留最佳候选。冷却或未重新武装时
+只按 `observe_interval_ms` 低频观察，正常状态才逐帧更新轨迹；目标覆盖不同参数、动态禁用
+或启用多尺度时会按对应策略单独匹配。
+
+调度器为每个目标独立记录最近中心、稳定历史、局部 ROI 和 miss 次数。锁定后优先搜索
+上次命中附近，局部失败会扩大 ROI，持续失败或周期校正时回到全屏。`tracking = false`
+可以关闭位置记忆并保留全屏路径。目标默认 `rearm = "disappear"`，点击后需连续若干次
+未命中才允许同一实例再次点击；需要固定周期点击且目标持续存在时可改为
+`rearm = "timer"`。设置 `rescan_interval_ms` 后，声明式引擎才会在没有新视频帧时
+低频重检同一最新帧（非零值限制在 50–60000ms）；默认路径等待新帧或取消信号。
 
 `forge.vision()` 返回 engine，可手动调用 `engine:process(frame)`，或读取
-`engine:stats()` 的 `scans`、`matches`。注册后默认自动生成 `on_frame`；脚本随后定义
+`engine:stats()` 的 `scans`、`matches`、`below_threshold`、
+`duplicate_frames_skipped`、`scene_gate_skipped`、`full_backoff_skipped`、
+`observation_backoff_skipped` 和逐目标 `scan_mode`、`last_decision`、`last_score` 状态。
+注册后默认自动生成 `on_frame`；脚本随后定义
 自己的 `on_frame` 即可接管调度，底层能力不会被限制。
 
 ## 帧 API
 
-- `frame.width`、`frame.height`、`frame.pts_us`
+- `frame.width`、`frame.height`、`frame.pts_us`、`frame.frame_seq`
+- `frame.rescan` / `frame.rescan_reason`：静止画面的定时重检及原因
 - `frame:pixel(x, y)`：返回 RGBA
 - `frame:find(path, threshold [, roi])`：单尺度最佳匹配
 - `frame:find_fast(path, threshold [, roi])`：只精修两个粗候选的极速单尺度匹配
 - `frame:find_gray(path, threshold [, roi])` / `frame:find_fast_gray(...)`：直接匹配 I420 亮度平面，跳过整帧 RGB 转换
 - `frame:find_first(paths, threshold [, roi])`：按优先级批量匹配
+- `frame:find_candidates(paths, threshold [, roi])`：为每个模板返回最佳候选，结果含
+  `index`、`position`、`x`、`y`、`w`、`h`、`confidence`
 - `frame:find_multiscale(path, threshold [, roi])`：多尺度匹配
 - `frame:find_all(path, threshold [, roi])`：全部匹配
 - `frame:save(path)`、`frame:crop(path, x1, y1, x2, y2)`
+
+视觉策略可按目标启用 `gray_gate = true`（或在顶层配置），先用 Y 平面快速筛选，
+只有候选通过 `gray_threshold` 才执行彩色确认；该开关默认关闭以保持召回率。
 
 匹配结果包含中心坐标 `x/y`、模板尺寸 `w/h` 和 `confidence`；批量结果还包含
 从 1 开始的 `index`。
@@ -97,3 +114,6 @@ forge.vision {
 脚本性能与预览性能彼此独立。`script-profile` 只影响上述 Lua 建议间隔，
 `preview-profile` 只影响 JPEG/WebSocket 刷新率；关闭或降低预览不会降低解码帧率，
 脚本仍然接收最新解码帧。
+
+声明式视觉配置可选 `scene_gate = true` 跳过相同亮度场景，也可设置
+`rescan_interval_ms` 对静止画面按需重检；相同 `frame_seq` 不会重复执行模板匹配。

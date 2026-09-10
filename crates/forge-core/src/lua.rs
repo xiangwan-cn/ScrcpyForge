@@ -1,5 +1,5 @@
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
 };
 use std::{
@@ -17,6 +17,7 @@ use crate::{adb::Adb, session::ScrcpySession, video::VideoFrame, ForgeEvent, Inp
 pub struct LuaRun {
     pub id: Uuid,
     cancelled: Arc<AtomicBool>,
+    cancel_wakeup: Arc<tokio::sync::Notify>,
     finished: Arc<AtomicBool>,
     processing: Arc<AtomicBool>,
     last_progress: Arc<std::sync::Mutex<Instant>>,
@@ -25,6 +26,7 @@ pub struct LuaRun {
 impl LuaRun {
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
+        self.cancel_wakeup.notify_one();
     }
     pub fn is_running(&self) -> bool {
         !self.finished.load(Ordering::Relaxed)
@@ -53,6 +55,7 @@ pub fn run(
 ) -> LuaRun {
     let id = Uuid::new_v4();
     let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_wakeup = Arc::new(tokio::sync::Notify::new());
     let finished = Arc::new(AtomicBool::new(false));
     let error = Arc::new(std::sync::Mutex::new(None));
     let error_out = error.clone();
@@ -76,6 +79,7 @@ pub fn run(
     LuaRun {
         id,
         cancelled,
+        cancel_wakeup,
         finished,
         processing: Arc::new(AtomicBool::new(false)),
         last_progress: Arc::new(std::sync::Mutex::new(Instant::now())),
@@ -83,18 +87,35 @@ pub fn run(
     }
 }
 
-/// Start a latency-first frame-driven Lua script. While Lua processes a frame,
-/// newer frames replace the pending slot so the next callback is always current.
+/// Start a latency-first frame-driven Lua script using the session's current
+/// script generation. This keeps the original public entry point available to
+/// embedders that attach the returned frame sender themselves.
 pub fn run_frames(
     source: String,
     script_dir: Option<PathBuf>,
     session: Arc<ScrcpySession>,
     events: tokio::sync::broadcast::Sender<ForgeEvent>,
 ) -> (LuaRun, tokio::sync::watch::Sender<Option<Arc<VideoFrame>>>) {
+    let generation = session.frames.begin_script();
+    run_frames_for_generation(source, script_dir, session, generation, events)
+}
+
+/// Start a latency-first frame-driven Lua script for an already allocated
+/// generation. While Lua processes a frame, newer frames replace the pending
+/// slot so the next callback is always current.
+pub fn run_frames_for_generation(
+    source: String,
+    script_dir: Option<PathBuf>,
+    session: Arc<ScrcpySession>,
+    generation: u64,
+    events: tokio::sync::broadcast::Sender<ForgeEvent>,
+) -> (LuaRun, tokio::sync::watch::Sender<Option<Arc<VideoFrame>>>) {
     let serial = session.serial.clone();
     let id = Uuid::new_v4();
     let cancelled = Arc::new(AtomicBool::new(false));
     let token = cancelled.clone();
+    let cancel_wakeup = Arc::new(tokio::sync::Notify::new());
+    let cancel_wakeup_out = cancel_wakeup.clone();
     let finished = Arc::new(AtomicBool::new(false));
     let done = finished.clone();
     let processing = Arc::new(AtomicBool::new(false));
@@ -104,6 +125,8 @@ pub fn run_frames(
     let error = Arc::new(std::sync::Mutex::new(None));
     let error_out = error.clone();
     let (tx, mut rx) = tokio::sync::watch::channel::<Option<Arc<VideoFrame>>>(None);
+    let rescan_interval_ms = Arc::new(AtomicU64::new(0));
+    let rescan_interval_out = rescan_interval_ms.clone();
     let runtime = Handle::current();
     std::thread::spawn(move || {
         let _ = events.send(ForgeEvent::ScriptStarted {
@@ -115,6 +138,19 @@ pub fn run_frames(
             let deadline = Arc::new(std::sync::Mutex::new(None));
             install_limits(&lua, token.clone(), Some(deadline.clone()))?;
             let forge = lua.create_table()?;
+            forge.set(
+                "_set_rescan_interval_ms",
+                lua.create_function(move |_, millis: Option<u64>| {
+                    let millis = millis.unwrap_or(0);
+                    let interval = if millis == 0 {
+                        0
+                    } else {
+                        millis.clamp(50, 60_000)
+                    };
+                    rescan_interval_out.store(interval, Ordering::Release);
+                    Ok(())
+                })?,
+            )?;
             forge.set(
                 "serial",
                 lua.create_function({
@@ -172,18 +208,67 @@ pub fn run_frames(
                 .map_err(|_| anyhow::anyhow!("Lua script must define on_frame(frame)"))?;
             let current = Arc::new(std::sync::RwLock::new(None));
             let table = create_frame_table(&lua, current.clone())?;
+            let mut first = true;
+            let mut last_processed_seq = None;
+            let mut last_frame: Option<Arc<VideoFrame>> = None;
             loop {
-                if runtime.block_on(rx.changed()).is_err() {
-                    break;
-                }
+                // A static screen normally produces no packet. Wait for a new
+                // frame or cancellation without invoking Lua. A script
+                // may opt into explicit static-screen rescans through the
+                // declarative vision configuration.
+                // With no static-screen rescan, cancellation is delivered by
+                // Notify instead of a periodic timer; it must not call Lua on
+                // the same frame. `Err(())` means cancellation or sender
+                // shutdown.
+                let wake: std::result::Result<Option<bool>, ()> = if first {
+                    first = false;
+                    Ok(Some(true))
+                } else {
+                    let interval_ms = rescan_interval_ms.load(Ordering::Acquire);
+                    runtime.block_on(async {
+                        if interval_ms == 0 {
+                            tokio::select! {
+                                changed = rx.changed() => changed.map(|_| Some(true)).map_err(|_| ()),
+                                _ = cancel_wakeup_out.notified() => Err(()),
+                            }
+                        } else {
+                            tokio::select! {
+                                changed = rx.changed() => changed.map(|_| Some(true)).map_err(|_| ()),
+                                _ = tokio::time::sleep(Duration::from_millis(interval_ms)) => Ok(Some(false)),
+                                _ = cancel_wakeup_out.notified() => Err(()),
+                            }
+                        }
+                    })
+                };
+                let fresh_frame = match wake {
+                    Ok(Some(value)) => value,
+                    Ok(None) => continue,
+                    Err(()) => break,
+                };
                 ensure_running(&token)?;
-                let Some(frame) = rx.borrow_and_update().clone() else {
+                let Some(frame) = rx
+                    .borrow_and_update()
+                    .clone()
+                    .or_else(|| last_frame.clone())
+                else {
                     continue;
                 };
+                let rescan = !fresh_frame;
+                if !rescan && frame.frame_seq != 0 && last_processed_seq == Some(frame.frame_seq) {
+                    continue;
+                }
+                if frame.frame_seq != 0 {
+                    last_processed_seq = Some(frame.frame_seq);
+                }
+                last_frame = Some(frame.clone());
                 *current.write().unwrap() = Some(frame.clone());
                 table.set("width", frame.width)?;
                 table.set("height", frame.height)?;
                 table.set("pts_us", frame.presentation_time_us)?;
+                table.set("frame_seq", frame.frame_seq)?;
+                table.set("rescan", rescan)?;
+                table.set("rescan_reason", if rescan { "timer" } else { "frame" })?;
+                table.set("scene_signature", frame.luma_signature()?)?;
                 let started = Instant::now();
                 *progress_out.lock().unwrap() = started;
                 *deadline.lock().unwrap() = Some(started + Duration::from_secs(5));
@@ -193,7 +278,12 @@ pub fn run_frames(
                 *deadline.lock().unwrap() = None;
                 *progress_out.lock().unwrap() = Instant::now();
                 callback_result?;
-                session.frames.record_script(started.elapsed());
+                session.frames.record_script_for_generation(
+                    started.elapsed(),
+                    frame.frame_seq,
+                    rescan,
+                    generation,
+                );
             }
             Ok(())
         }));
@@ -209,6 +299,10 @@ pub fn run_frames(
                 }
             ))
         });
+        // A script may finish because its source/callback failed, rather than
+        // through the daemon's explicit stop endpoint. Detach only this run's
+        // sender so a newer generation is never cleared by an old worker.
+        session.frames.detach_script_if(generation);
         let message = result.err().map(|e| e.to_string());
         if let Some(ref value) = message {
             tracing::warn!(run_id=%id,error=%value,"Lua frame script stopped")
@@ -224,6 +318,7 @@ pub fn run_frames(
         LuaRun {
             id,
             cancelled,
+            cancel_wakeup,
             finished,
             processing,
             last_progress,
@@ -265,9 +360,8 @@ fn create_frame_table(lua: &Lua, current: CurrentFrame) -> mlua::Result<Table> {
                 if x >= f.width || y >= f.height {
                     return Err(LuaError::RuntimeError("pixel out of bounds".into()));
                 }
-                let rgb = f.rgb().map_err(LuaError::external)?;
-                let i = (y * f.width * 3 + x * 3) as usize;
-                Ok((rgb[i], rgb[i + 1], rgb[i + 2], 255u8))
+                let (r, g, b) = f.pixel_rgb(x, y).map_err(LuaError::external)?;
+                Ok((r, g, b, 255u8))
             }
         })?,
     )?;
@@ -299,6 +393,36 @@ fn create_frame_table(lua: &Lua, current: CurrentFrame) -> mlua::Result<Table> {
                     }
                     None => Ok(None),
                 }
+            }
+        })?,
+    )?;
+    table.set(
+        "find_candidates",
+        lua.create_function({
+            let c = current.clone();
+            move |lua, (_, paths, threshold, roi): (Table, Table, Option<f32>, Option<Table>)| {
+                let f = current_frame(&c)?;
+                let paths = paths
+                    .sequence_values::<String>()
+                    .map(|value| value.map(PathBuf::from))
+                    .collect::<mlua::Result<Vec<_>>>()?;
+                let found = crate::cv::find_candidates(
+                    &f,
+                    &paths,
+                    threshold.unwrap_or(0.8),
+                    parse_roi(roi)?,
+                )
+                .map_err(LuaError::external)?;
+                let list = lua.create_table()?;
+                for (position, item) in found.iter().enumerate() {
+                    let result = match_table(lua, item)?;
+                    // Native candidates carry a zero-based template index;
+                    // Lua scripts use the stable one-based list index.
+                    result.set("index", item.template_index + 1)?;
+                    result.set("position", position + 1)?;
+                    list.set(position + 1, result)?;
+                }
+                Ok(list)
             }
         })?,
     )?;
@@ -651,9 +775,8 @@ fn add_session_calls(
         "performance_profile",
         lua.create_function({
             let s = session.clone();
-            let r = runtime.clone();
             move |_, ()| {
-                Ok(match r.block_on(s.frames.profile()) {
+                Ok(match s.frames.profile_now() {
                     crate::session::PerformanceProfile::Auto => "auto",
                     crate::session::PerformanceProfile::Eco => "eco",
                     crate::session::PerformanceProfile::Balanced => "balanced",
@@ -666,9 +789,8 @@ fn add_session_calls(
         "recommended_interval_ms",
         lua.create_function({
             let s = session.clone();
-            let r = runtime.clone();
             move |_, ()| {
-                Ok(match r.block_on(s.frames.profile()) {
+                Ok(match s.frames.profile_now() {
                     crate::session::PerformanceProfile::Realtime => 0,
                     crate::session::PerformanceProfile::Balanced => 30,
                     crate::session::PerformanceProfile::Eco => 150,

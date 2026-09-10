@@ -42,8 +42,40 @@ struct Metrics {
     script_p50_ms: f64,
     script_p95_ms: f64,
     dropped_script_frames: u64,
+    #[serde(default)]
+    script_rescans: u64,
+    #[serde(default)]
+    last_publish_us: u64,
+    #[serde(default)]
+    input_failures: u64,
+    #[serde(default)]
+    last_input_us: u64,
+    #[serde(default)]
+    video_packet_errors: u64,
+    #[serde(default)]
+    video_decode_errors: u64,
+    #[serde(default)]
+    latest_frame_seq: u64,
+    #[serde(default)]
+    preview_dropped_frames: u64,
+    #[serde(default)]
+    preview_leases: u64,
+    #[serde(default)]
+    activity_state: String,
     profile: String,
     preview_profile: String,
+}
+#[derive(Clone, Deserialize)]
+struct SessionSnapshot {
+    serial: String,
+    metrics: Metrics,
+}
+#[derive(Deserialize)]
+struct StateSnapshot {
+    devices: Vec<Device>,
+    sessions: Vec<SessionSnapshot>,
+    runs: Vec<ScriptRun>,
+    scripts: Vec<String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -95,13 +127,31 @@ enum Event {
     Status(String),
 }
 
-type LatestFrames = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+struct DecodedFrame {
+    size: [usize; 2],
+    rgba: Vec<u8>,
+}
+type LatestFrames = Arc<Mutex<HashMap<String, DecodedFrame>>>;
 
-fn store_latest_frame(latest_frames: &LatestFrames, serial: String, bytes: Vec<u8>) {
+fn store_decoded_frame(latest_frames: &LatestFrames, serial: String, frame: DecodedFrame) {
     latest_frames
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .insert(serial, bytes);
+        .insert(serial, frame);
+}
+
+fn store_latest_frame(latest_frames: &LatestFrames, serial: String, bytes: Vec<u8>) -> bool {
+    if let Ok(image) = image::load_from_memory(&bytes) {
+        let rgba = image.to_rgba8();
+        let decoded = DecodedFrame {
+            size: [rgba.width() as usize, rgba.height() as usize],
+            rgba: rgba.into_raw(),
+        };
+        store_decoded_frame(latest_frames, serial, decoded);
+        true
+    } else {
+        false
+    }
 }
 
 struct App {
@@ -165,8 +215,10 @@ impl App {
             last_tick: Instant::now(),
         }
     }
-    fn receive(&mut self, ctx: &Context) {
+    fn receive(&mut self, ctx: &Context) -> bool {
+        let mut changed = false;
         while let Ok(event) = self.events.try_recv() {
+            changed = true;
             match event {
                 Event::Devices(v) => self.devices = v,
                 Event::PairingServices(result) => match result {
@@ -229,34 +281,36 @@ impl App {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             std::mem::take(&mut *latest)
         };
-        for (serial, bytes) in frames {
-            if let Ok(img) = image::load_from_memory(&bytes) {
-                let rgba = img.to_rgba8();
-                let size = [rgba.width() as usize, rgba.height() as usize];
-                let color = ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
-                if let Some(texture) = self.textures.get_mut(&serial) {
-                    texture.set(color, egui::TextureOptions::LINEAR)
-                } else {
-                    self.textures.insert(
-                        serial.clone(),
-                        ctx.load_texture(
-                            format!("device-{serial}"),
-                            color,
-                            egui::TextureOptions::LINEAR,
-                        ),
-                    );
-                }
+        changed |= !frames.is_empty();
+        for (serial, frame) in frames {
+            let color = ColorImage::from_rgba_unmultiplied(frame.size, &frame.rgba);
+            if let Some(texture) = self.textures.get_mut(&serial) {
+                texture.set(color, egui::TextureOptions::LINEAR)
+            } else {
+                self.textures.insert(
+                    serial.clone(),
+                    ctx.load_texture(
+                        format!("device-{serial}"),
+                        color,
+                        egui::TextureOptions::LINEAR,
+                    ),
+                );
             }
         }
-        ctx.request_repaint();
+        changed
     }
 }
 
 impl eframe::App for App {
+    #[allow(clippy::possible_missing_else)]
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        self.receive(&ctx);
-        if !self.pairing_busy && self.last_tick.elapsed() > Duration::from_secs(2) {
+        let window_active = viewport_active(&ctx);
+        if self.receive(&ctx) && window_active {
+            ctx.request_repaint();
+        }
+        if window_active && !self.pairing_busy && self.last_tick.elapsed() > Duration::from_secs(2)
+        {
             let _ = self.commands.send(Command::Refresh);
             self.last_tick = Instant::now();
         }
@@ -415,14 +469,22 @@ impl eframe::App for App {
      }else{ui.allocate_ui(egui::vec2(width-24.0,h.min(360.0)),|ui|{ui.centered_and_justified(|ui|{ui.label(if session_running{"等待视频帧"}else{"会话未启动"});});});}
      ui.horizontal(|ui|{ui.strong(device.model.as_deref().unwrap_or(serial));ui.label(if device.wireless{"无线"}else{"USB"});ui.label(if session_running{"● 会话运行中"}else{"○ 会话停止"});});ui.small(format!("{} · {}",serial,device.state));
      ui.horizontal_wrapped(|ui|{if !session_running{if ui.button("启动会话").clicked(){let _=self.commands.send(Command::StartSession(serial.clone()));}}else if ui.button("停止会话").clicked(){let _=self.commands.send(Command::StopSession(serial.clone()));}let mode=self.modes.entry(serial.clone()).or_insert(Mode::Realtime);egui::ComboBox::from_id_salt(format!("mode-{serial}")).selected_text(match mode{Mode::Realtime=>"实时预览",Mode::FiveSeconds=>"五秒一图",Mode::Off=>"关闭预览"}).show_ui(ui,|ui|{for(value,label)in[(Mode::Realtime,"实时预览"),(Mode::FiveSeconds,"五秒一图"),(Mode::Off,"关闭预览")]{if ui.selectable_value(mode,value,label).changed(){let _=self.commands.send(Command::SetMode(serial.clone(),value));}}});});
-     if let Some(metric)=self.metrics.get(serial){ui.small(format!("解码 {:.1} · 预览 {:.1} · 脚本 {:.1} FPS｜均值 {:.1}ms · P50 {:.1} · P95 {:.1} · 丢帧 {}",metric.decoded_fps,metric.preview_fps,metric.script_fps,metric.average_script_ms,metric.script_p50_ms,metric.script_p95_ms,metric.dropped_script_frames));ui.horizontal_wrapped(|ui|{let mut script_profile=metric.profile.clone();egui::ComboBox::from_id_salt(format!("script-profile-{serial}")).selected_text(format!("脚本：{}",script_profile)).show_ui(ui,|ui|{for(value,label)in[("auto","自动"),("eco","节能"),("balanced","均衡"),("realtime","实时")]{if ui.selectable_value(&mut script_profile,value.to_owned(),label).changed(){let _=self.commands.send(Command::SetScriptProfile(serial.clone(),value.to_owned()));}}});let mut preview_profile=metric.preview_profile.clone();egui::ComboBox::from_id_salt(format!("preview-profile-{serial}")).selected_text(format!("预览：{}",preview_profile)).show_ui(ui,|ui|{for(value,label)in[("auto","自动"),("eco","节能"),("balanced","均衡"),("realtime","实时")]{if ui.selectable_value(&mut preview_profile,value.to_owned(),label).changed(){let _=self.commands.send(Command::SetPreviewProfile(serial.clone(),value.to_owned()));}}});});}
+     if let Some(metric)=self.metrics.get(serial){ui.small(format!("解码 {:.1} · 预览 {:.1} · 脚本 {:.1} FPS｜均值 {:.1}ms · P50 {:.1} · P95 {:.1} · 脚本丢帧 {} · 预览丢帧 {} · 重检 {} · 发布 {}μs · 输入 {}μs（失败 {}）· 视频错误 {} · 帧序 {} · {} 租约 {}",metric.decoded_fps,metric.preview_fps,metric.script_fps,metric.average_script_ms,metric.script_p50_ms,metric.script_p95_ms,metric.dropped_script_frames,metric.preview_dropped_frames,metric.script_rescans,metric.last_publish_us,metric.last_input_us,metric.input_failures,metric.video_packet_errors+metric.video_decode_errors,metric.latest_frame_seq,metric.activity_state,metric.preview_leases));ui.horizontal_wrapped(|ui|{let mut script_profile=metric.profile.clone();egui::ComboBox::from_id_salt(format!("script-profile-{serial}")).selected_text(format!("脚本：{}",script_profile)).show_ui(ui,|ui|{for(value,label)in[("auto","自动"),("eco","节能"),("balanced","均衡"),("realtime","实时")]{if ui.selectable_value(&mut script_profile,value.to_owned(),label).changed(){let _=self.commands.send(Command::SetScriptProfile(serial.clone(),value.to_owned()));}}});let mut preview_profile=metric.preview_profile.clone();egui::ComboBox::from_id_salt(format!("preview-profile-{serial}")).selected_text(format!("预览：{}",preview_profile)).show_ui(ui,|ui|{for(value,label)in[("auto","自动"),("eco","节能"),("balanced","均衡"),("realtime","实时")]{if ui.selectable_value(&mut preview_profile,value.to_owned(),label).changed(){let _=self.commands.send(Command::SetPreviewProfile(serial.clone(),value.to_owned()));}}});});}
      ui.horizontal_wrapped(|ui|{let inspect=self.inspect.entry(serial.clone()).or_insert(Inspect::None);if ui.selectable_label(*inspect==Inspect::Point,"点选坐标").clicked(){*inspect=if *inspect==Inspect::Point{Inspect::None}else{Inspect::Point};}if ui.selectable_label(*inspect==Inspect::Region,"框选模板").clicked(){*inspect=if *inspect==Inspect::Region{Inspect::None}else{Inspect::Region};}if let Some((x,y))=self.points.get(serial){ui.label(format!("坐标：{x}, {y}"));}});
      ui.horizontal(|ui|{ui.label("保存位置");ui.add(egui::TextEdit::singleline(self.paths.entry(serial.clone()).or_insert_with(||default_template_name(serial))).id_source(("template-path",serial)));});
      ui.separator();ui.horizontal_wrapped(|ui|{let default=self.scripts.first().cloned().unwrap_or_default();let choice=self.selected.entry(serial.clone()).or_insert(default);egui::ComboBox::from_id_salt(format!("script-{serial}")).selected_text(if choice.is_empty(){"无可用脚本"}else{choice.as_str()}).show_ui(ui,|ui|{for name in &self.scripts{ui.selectable_value(choice,name.clone(),name);}});if let Some(active)=run{ui.colored_label(if active.stalled{egui::Color32::LIGHT_RED}else{egui::Color32::LIGHT_GREEN},format!("{} {}",if active.stalled{"⚠ 疑似卡顿"}else{"●"},active.name.as_deref().unwrap_or("脚本"))).on_hover_text(format!("运行 ID: {}",active.run_id));if ui.button("停止脚本").clicked(){let _=self.commands.send(Command::StopScript(serial.clone()));}}else{let enabled=session_running&&!choice.is_empty();if ui.add_enabled(enabled,egui::Button::new("运行脚本")).clicked(){let _=self.commands.send(Command::RunScript(serial.clone(),choice.clone()));}}});
     });});}});ui.add_space(10.0);}
   });});
-        ctx.request_repaint_after(Duration::from_secs(1));
+        if window_active {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
     }
+}
+
+fn viewport_active(ctx: &Context) -> bool {
+    ctx.input(|input| {
+        input.viewport().visible().unwrap_or(true) && input.viewport().focused.unwrap_or(true)
+    })
 }
 
 fn configure(ctx: &Context) {
@@ -510,15 +572,36 @@ fn spawn_backend(
         let mut modes: HashMap<String, (Mode, Instant)> = HashMap::new();
         let mut preview_profiles: HashMap<String, String> = HashMap::new();
         let mut streams: HashMap<String, Arc<AtomicBool>> = HashMap::new();
+        let mut state_etag: Option<String> = None;
+        let mut frame_etags: HashMap<String, String> = HashMap::new();
         loop {
-            match commands.recv_timeout(Duration::from_millis(80)) {
+            let command_wait = if viewport_active(&ctx) {
+                Duration::from_millis(80)
+            } else {
+                Duration::from_millis(500)
+            };
+            match commands.recv_timeout(command_wait) {
                 Ok(Command::Refresh) => {
-                    let devices = get::<Vec<Device>>(&client, &format!("{api}/devices"));
-                    let scripts = get::<Vec<String>>(&client, &format!("{api}/scripts"));
-                    let runs = get::<Vec<ScriptRun>>(&client, &format!("{api}/scripts/runs"));
-                    let sessions = get::<Vec<String>>(&client, &format!("{api}/sessions"));
-                    match (devices, scripts, runs, sessions) {
-                        (Ok(d), Ok(sc), Ok(r), Ok(se)) => {
+                    match get_state::<StateSnapshot>(
+                        &client,
+                        &format!("{api}/state"),
+                        &mut state_etag,
+                    ) {
+                        Ok(Some(snapshot)) => {
+                            let StateSnapshot {
+                                devices: d,
+                                sessions: session_snapshots,
+                                runs: r,
+                                scripts: sc,
+                            } = snapshot;
+                            let se = session_snapshots
+                                .iter()
+                                .map(|session| session.serial.clone())
+                                .collect::<Vec<_>>();
+                            let metrics = session_snapshots
+                                .into_iter()
+                                .map(|session| (session.serial, session.metrics))
+                                .collect::<HashMap<_, _>>();
                             for serial in &se {
                                 modes.entry(serial.clone()).or_insert((
                                     Mode::Realtime,
@@ -530,22 +613,12 @@ fn spawn_backend(
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .retain(|serial, _| se.contains(serial));
-                            let metrics: HashMap<_, _> = se
-                                .iter()
-                                .filter_map(|serial| {
-                                    get::<Metrics>(
-                                        &client,
-                                        &format!("{api}/sessions/{}/metrics", url(serial)),
-                                    )
-                                    .ok()
-                                    .map(|m| (serial.clone(), m))
-                                })
-                                .collect();
                             for (serial, metric) in &metrics {
                                 preview_profiles
                                     .insert(serial.clone(), metric.preview_profile.clone());
                             }
                             preview_profiles.retain(|serial, _| se.contains(serial));
+                            frame_etags.retain(|serial, _| se.contains(serial));
                             let _ = events.send(Event::Devices(d));
                             let _ = events.send(Event::Scripts(sc));
                             let _ = events.send(Event::Runs(r));
@@ -553,6 +626,7 @@ fn spawn_backend(
                             let _ = events.send(Event::Metrics(metrics));
                             let _ = events.send(Event::Status("后端运行中".into()));
                         }
+                        Ok(None) => {}
                         _ => {
                             let _ = events.send(Event::Status("后端不可用".into()));
                         }
@@ -622,15 +696,18 @@ fn spawn_backend(
                         &format!("{api}/sessions/{}/start", url(&serial)),
                         serde_json::json!({}),
                     );
-                    let _ = events.send(Event::Status(if result.is_ok() {
-                        format!("{serial} 会话已启动")
-                    } else {
-                        format!("启动失败：{}", result.unwrap_err())
-                    }));
-                    modes.insert(
-                        serial,
-                        (Mode::Realtime, Instant::now() - Duration::from_secs(10)),
-                    );
+                    let started = result.is_ok();
+                    let status = match result {
+                        Ok(()) => format!("{serial} 会话已启动"),
+                        Err(error) => format!("启动失败：{error}"),
+                    };
+                    let _ = events.send(Event::Status(status));
+                    if started {
+                        modes.insert(
+                            serial,
+                            (Mode::Realtime, Instant::now() - Duration::from_secs(10)),
+                        );
+                    }
                 }
                 Ok(Command::StopSession(serial)) => {
                     let _ = client
@@ -644,6 +721,7 @@ fn spawn_backend(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&serial);
+                    frame_etags.remove(&serial);
                 }
                 Ok(Command::StartAll) => {
                     let _ = client.post(format!("{api}/sessions/start-all")).send();
@@ -658,6 +736,7 @@ fn spawn_backend(
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .clear();
+                    frame_etags.clear();
                 }
                 Ok(Command::StopAllScripts) => {
                     let _ = client.post(format!("{api}/scripts/stop-all")).send();
@@ -668,11 +747,11 @@ fn spawn_backend(
                         &format!("{api}/scripts/run-named"),
                         serde_json::json!({"serial":serial,"name":name}),
                     );
-                    let _ = events.send(Event::Status(if result.is_ok() {
-                        format!("{serial} 脚本已启动")
-                    } else {
-                        format!("脚本启动失败：{}", result.unwrap_err())
-                    }));
+                    let status = match result {
+                        Ok(()) => format!("{serial} 脚本已启动"),
+                        Err(error) => format!("脚本启动失败：{error}"),
+                    };
+                    let _ = events.send(Event::Status(status));
                 }
                 Ok(Command::StopScript(serial)) => {
                     let _ = client
@@ -714,11 +793,23 @@ fn spawn_backend(
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .remove(&serial);
+                        frame_etags.remove(&serial);
                     }
                     modes.insert(serial, (mode, Instant::now() - Duration::from_secs(10)));
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if !viewport_active(&ctx) {
+                for token in streams.values() {
+                    token.store(false, Ordering::Relaxed);
+                }
+                streams.clear();
+                latest_frames
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .clear();
+                continue;
             }
             streams.retain(|serial, token| {
                 modes
@@ -726,8 +817,11 @@ fn spawn_backend(
                     .is_some_and(|(mode, _)| *mode == Mode::Realtime)
                     && token.load(Ordering::Relaxed)
             });
-            for (serial, (mode, _)) in &modes {
-                if *mode == Mode::Realtime && !streams.contains_key(serial) {
+            for (serial, (mode, last)) in &mut modes {
+                if *mode == Mode::Realtime
+                    && !streams.contains_key(serial)
+                    && last.elapsed() >= Duration::from_secs(1)
+                {
                     let token = Arc::new(AtomicBool::new(true));
                     spawn_preview_ws(
                         api.clone(),
@@ -737,20 +831,41 @@ fn spawn_backend(
                         ctx.clone(),
                     );
                     streams.insert(serial.clone(), token);
+                    *last = Instant::now();
                 }
             }
             for (serial, (mode, last)) in &mut modes {
                 let due =
                     matches!(mode, Mode::FiveSeconds) && last.elapsed() >= Duration::from_secs(5);
                 if due {
-                    if let Ok(bytes) = client
-                        .get(format!("{api}/sessions/{}/frame.jpg", url(serial)))
-                        .send()
-                        .and_then(|r| r.error_for_status())
-                        .and_then(|r| r.bytes())
-                    {
-                        store_latest_frame(&latest_frames, serial.clone(), bytes.to_vec());
-                        ctx.request_repaint();
+                    let mut request =
+                        client.get(format!("{api}/sessions/{}/frame.jpg", url(serial)));
+                    if let Some(etag) = frame_etags.get(serial) {
+                        request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+                    }
+                    if let Ok(response) = request.send() {
+                        if response.status().as_u16() != 304 {
+                            let etag = response
+                                .headers()
+                                .get(reqwest::header::ETAG)
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned);
+                            if let Ok(response) = response.error_for_status() {
+                                if let Ok(bytes) = response.bytes() {
+                                    if store_latest_frame(
+                                        &latest_frames,
+                                        serial.clone(),
+                                        bytes.to_vec(),
+                                    ) && viewport_active(&ctx)
+                                    {
+                                        ctx.request_repaint();
+                                    }
+                                    if let Some(etag) = etag {
+                                        frame_etags.insert(serial.clone(), etag);
+                                    }
+                                }
+                            }
+                        }
                     }
                     *last = Instant::now();
                 }
@@ -781,12 +896,14 @@ fn spawn_preview_ws(
             while running.load(Ordering::Relaxed) {
                 match socket.read() {
                     Ok(message) if message.is_binary() => {
-                        store_latest_frame(
+                        if store_latest_frame(
                             &latest_frames,
                             serial.clone(),
                             message.into_data().to_vec(),
-                        );
-                        ctx.request_repaint();
+                        ) && viewport_active(&ctx)
+                        {
+                            ctx.request_repaint();
+                        }
                     }
                     Ok(_) => {}
                     Err(tungstenite::Error::Io(error))
@@ -811,6 +928,31 @@ fn get<T: serde::de::DeserializeOwned>(
 ) -> Result<T, reqwest::Error> {
     client.get(url).send()?.error_for_status()?.json()
 }
+fn get_state<T: serde::de::DeserializeOwned>(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    etag: &mut Option<String>,
+) -> Result<Option<T>, reqwest::Error> {
+    let mut request = client.get(url);
+    if let Some(value) = etag.as_deref() {
+        request = request.header(reqwest::header::IF_NONE_MATCH, value);
+    }
+    let response = request.send()?;
+    if response.status().as_u16() == 304 {
+        return Ok(None);
+    }
+    let value = response
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let response = response.error_for_status()?;
+    let result = response.json()?;
+    if value.is_some() {
+        *etag = value;
+    }
+    Ok(Some(result))
+}
 fn post(
     client: &reqwest::blocking::Client,
     url: &str,
@@ -820,10 +962,16 @@ fn post(
     Ok(())
 }
 fn url(value: &str) -> String {
-    value
-        .replace('%', "%25")
-        .replace(':', "%3A")
-        .replace('/', "%2F")
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push('%');
+            encoded.push_str(&format!("{byte:02X}"));
+        }
+    }
+    encoded
 }
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -842,7 +990,7 @@ fn main() -> eframe::Result {
 
 #[cfg(test)]
 mod tests {
-    use super::{endpoint_looks_valid, store_latest_frame, LatestFrames};
+    use super::{endpoint_looks_valid, store_decoded_frame, DecodedFrame, LatestFrames};
 
     #[test]
     fn validates_pairing_endpoints() {
@@ -855,13 +1003,17 @@ mod tests {
     #[test]
     fn keeps_only_latest_frame_per_device() {
         let frames = LatestFrames::default();
-        store_latest_frame(&frames, "device-1".into(), vec![1]);
-        store_latest_frame(&frames, "device-1".into(), vec![2]);
-        store_latest_frame(&frames, "device-2".into(), vec![3]);
+        let frame = |value| DecodedFrame {
+            size: [1, 1],
+            rgba: vec![value, 0, 0, 255],
+        };
+        store_decoded_frame(&frames, "device-1".into(), frame(1));
+        store_decoded_frame(&frames, "device-1".into(), frame(2));
+        store_decoded_frame(&frames, "device-2".into(), frame(3));
 
         let frames = frames.lock().unwrap();
         assert_eq!(frames.len(), 2);
-        assert_eq!(frames["device-1"], vec![2]);
-        assert_eq!(frames["device-2"], vec![3]);
+        assert_eq!(frames["device-1"].rgba, vec![2, 0, 0, 255]);
+        assert_eq!(frames["device-2"].rgba, vec![3, 0, 0, 255]);
     }
 }

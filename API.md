@@ -29,7 +29,26 @@ Returns service state and crate version.
 ### `GET /capabilities`
 
 Returns the API version, scrcpy server version, codecs, vision modes, Lua
-version, preview modes, and performance profiles supported by this daemon.
+version, preview modes, capture profiles, ETag support, and performance
+profiles supported by this daemon.
+
+### `GET /state`
+
+Returns one consistent snapshot for clients that need devices, running sessions,
+session metrics, active script runs, and available named scripts. Desktop and
+browser clients should prefer this aggregate endpoint over issuing one request
+per device during refresh. The response includes an `ETag`; send it as
+`If-None-Match` to receive `304 Not Modified` when the stable state has not
+changed.
+
+```json
+{
+  "devices": [],
+  "sessions": [],
+  "runs": [],
+  "scripts": ["example_all_api"]
+}
+```
 
 ### `POST /shutdown`
 
@@ -106,8 +125,9 @@ scrcpy session.
 
 ### `POST /devices/{serial}/input`
 
-Sends one input action. Tap and text use the scrcpy control socket when a
-session exists; other actions have an ADB fallback. Returns `204 No Content`.
+Sends one input action. Tap, swipe, text, and key use the scrcpy control socket
+when a session exists; ADB is used only when no session is running. Returns
+`204 No Content`.
 
 ```json
 {"type":"tap","x":320,"y":640}
@@ -153,7 +173,10 @@ All fields are optional. Unknown codec strings currently fall back to `h264`.
 ```
 
 Defaults are H.264, maximum dimension 1280, 8 Mbps, 60 fps, automatic encoder,
-and stay-awake enabled. Starting an already-running session is idempotent.
+and stay-awake enabled. `profile` may be `eco`, `balanced`, or `realtime` to
+select the corresponding capture defaults; explicitly supplied size, bitrate,
+or FPS values take precedence. Starting an already-running session is
+idempotent.
 
 ```json
 {"device_name":"Android device","codec":"H264"}
@@ -203,7 +226,10 @@ profile body and returns `204 No Content`.
 
 ### `GET /sessions/{serial}/metrics`
 
-Returns cumulative counts and rolling performance data.
+Returns cumulative counts and rolling performance data. `latest_frame_seq` is
+the decoder sequence used by frame-driven scripts; `preview_leases` reports
+active WebSocket/HTTP preview consumers, and `activity_state` is `active`,
+`idle_grace`, or `suspended`.
 
 ```json
 {
@@ -218,6 +244,24 @@ Returns cumulative counts and rolling performance data.
   "average_script_ms":3.4,
   "script_p50_ms":3.0,
   "script_p95_ms":5.8,
+  "script_published":450,
+  "script_rescans":30,
+  "script_source_seq":1180,
+  "script_generation":2,
+  "last_publish_us":180,
+  "input_batches":14,
+  "input_failures":0,
+  "last_input_us":2400,
+  "video_packet_errors":0,
+  "video_decode_errors":0,
+  "video_dimension_changes":1,
+  "last_video_error":null,
+  "latest_frame_seq":1200,
+  "preview_leases":1,
+  "preview_dropped_frames":0,
+  "script_active":true,
+  "activity_state":"active",
+  "idle_for_ms":0,
   "profile":"auto",
   "preview_profile":"eco"
 }
@@ -225,8 +269,10 @@ Returns cumulative counts and rolling performance data.
 
 ### `GET /sessions/{serial}/frame.jpg`
 
-Returns the latest decoded frame as `image/jpeg` with `Cache-Control: no-store`.
-The session must have decoded at least one frame.
+Returns the latest decoded frame as `image/jpeg` with an ETag derived from the
+session and `frame_seq`. Send `If-None-Match` to avoid re-encoding an unchanged
+frame and receive `304 Not Modified`. The session must have decoded at least
+one frame.
 
 ### `GET /sessions/{serial}/preview`
 
@@ -236,8 +282,9 @@ frequency follows the preview mode/profile; slow clients may skip frames.
 ### `POST /sessions/{serial}/regions`
 
 Crops the latest decoded frame and saves a PNG. Coordinates are
-`x1,y1,x2,y2`. Supply either a safe template `name` or `path`; a relative path
-is resolved under the templates directory.
+`x1,y1,x2,y2`. Supply either a safe template `name` or `path`; `path` must be a
+relative `.png` path under the templates directory. Absolute paths, parent
+components, symbolic-link parents, and symbolic-link outputs are rejected.
 
 ```json
 {"name":"confirm_button","x1":100,"y1":200,"x2":300,"y2":260}

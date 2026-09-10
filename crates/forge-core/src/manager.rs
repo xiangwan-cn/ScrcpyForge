@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use anyhow::Result;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock};
 
 use crate::{
     adb::Adb,
@@ -16,6 +16,10 @@ pub struct DeviceManager {
     events: broadcast::Sender<ForgeEvent>,
     sessions: Arc<RwLock<HashMap<String, Arc<ScrcpySession>>>>,
     start_locks: Arc<std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    // A scan can involve ADB plus an mDNS browse. Serialize all callers so a
+    // button click cannot start a second expensive discovery while the
+    // background poll is still running.
+    scan_gate: Arc<Mutex<()>>,
 }
 
 impl DeviceManager {
@@ -27,6 +31,7 @@ impl DeviceManager {
             events,
             sessions: Default::default(),
             start_locks: Default::default(),
+            scan_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -45,13 +50,34 @@ impl DeviceManager {
     pub async fn session(&self, serial: &str) -> Option<Arc<ScrcpySession>> {
         let value = self.sessions.read().await.get(serial).cloned();
         if value.as_ref().is_some_and(|s| !s.is_alive()) {
-            if let Some(session) = self.sessions.write().await.remove(serial) {
+            let stale = value.as_ref().expect("checked above").clone();
+            let removed = {
+                let mut sessions = self.sessions.write().await;
+                if sessions
+                    .get(serial)
+                    .is_some_and(|current| Arc::ptr_eq(current, &stale))
+                {
+                    sessions.remove(serial)
+                } else {
+                    None
+                }
+            };
+            if let Some(session) = removed {
                 let _ = session.shutdown().await;
             }
             None
         } else {
             value
         }
+    }
+    pub async fn sessions(&self) -> Vec<(String, Arc<ScrcpySession>)> {
+        self.sessions
+            .read()
+            .await
+            .iter()
+            .filter(|(_, session)| session.is_alive())
+            .map(|(serial, session)| (serial.clone(), session.clone()))
+            .collect()
     }
     pub async fn start_session(
         &self,
@@ -67,16 +93,32 @@ impl DeviceManager {
             .clone();
         let _guard = lock.lock().await;
         if let Some(existing) = self.session(&serial).await {
+            drop(_guard);
+            self.prune_start_lock(&serial, &lock);
             return Ok(existing);
         }
-        let session = Arc::new(ScrcpySession::connect(serial.clone(), options).await?);
+        let result = ScrcpySession::connect(serial.clone(), options).await;
+        let session = Arc::new(match result {
+            Ok(session) => session,
+            Err(error) => {
+                drop(_guard);
+                self.prune_start_lock(&serial, &lock);
+                return Err(error);
+            }
+        });
         self.sessions.write().await.insert(serial, session.clone());
+        drop(_guard);
+        self.prune_start_lock(&session.serial, &lock);
         Ok(session)
     }
     pub async fn stop_session(&self, serial: &str) -> bool {
         let session = self.sessions.write().await.remove(serial);
         if let Some(session) = session {
             let _ = session.shutdown().await;
+            let lock = self.start_locks.lock().unwrap().get(serial).cloned();
+            if let Some(lock) = lock {
+                self.prune_start_lock(serial, &lock);
+            }
             true
         } else {
             false
@@ -93,9 +135,20 @@ impl DeviceManager {
         for session in sessions {
             let _ = session.shutdown().await;
         }
+        let locks = self
+            .start_locks
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(serial, lock)| (serial.clone(), lock.clone()))
+            .collect::<Vec<_>>();
+        for (serial, lock) in locks {
+            self.prune_start_lock(&serial, &lock);
+        }
     }
 
     pub async fn scan(&self, connect_mdns: bool) -> Result<Vec<DeviceInfo>> {
+        let _scan_guard = self.scan_gate.lock().await;
         let mut devices = self.adb.devices().await?;
         if connect_mdns
             && !devices
@@ -112,14 +165,31 @@ impl DeviceManager {
         devices.sort_by_key(|device| (!device.wireless, device.serial.starts_with('[')));
         let mut seen_wireless = std::collections::HashSet::new();
         devices.retain(|device| {
-            !device.wireless
-                || (device.product.is_none() && device.model.is_none())
-                || seen_wireless.insert((device.product.clone(), device.model.clone()))
+            if !device.wireless || !matches!(device.state, crate::DeviceState::Device) {
+                return true;
+            }
+            // transport_id is the only stable identity ADB exposes for two
+            // address aliases of one transport. Never collapse devices merely
+            // because they share a product/model (a lab often has many
+            // identical phones); without a transport id retain the serial.
+            let key = device
+                .transport_id
+                .as_ref()
+                .map(|id| format!("transport:{id}"))
+                .unwrap_or_else(|| format!("serial:{}", device.serial));
+            seen_wireless.insert(key)
         });
-        *self.devices.write().await = devices.clone();
-        let _ = self.events.send(ForgeEvent::DeviceSnapshot {
-            devices: devices.clone(),
-        });
+        let changed = {
+            let mut current = self.devices.write().await;
+            let changed = *current != devices;
+            *current = devices.clone();
+            changed
+        };
+        if changed {
+            let _ = self.events.send(ForgeEvent::DeviceSnapshot {
+                devices: devices.clone(),
+            });
+        }
         Ok(devices)
     }
 
@@ -163,6 +233,19 @@ impl DeviceManager {
 
     pub async fn input(&self, serial: &str, action: &InputAction) -> Result<()> {
         self.adb.input(serial, action).await
+    }
+
+    fn prune_start_lock(&self, serial: &str, lock: &Arc<tokio::sync::Mutex<()>>) {
+        let mut locks = self.start_locks.lock().unwrap();
+        if locks
+            .get(serial)
+            .is_some_and(|current| Arc::ptr_eq(current, lock) && Arc::strong_count(current) == 2)
+        {
+            // One reference belongs to the map and one to the caller. Waiting
+            // starters keep extra references, so their lock is never removed
+            // while it can still serialize a new session.
+            locks.remove(serial);
+        }
     }
 }
 

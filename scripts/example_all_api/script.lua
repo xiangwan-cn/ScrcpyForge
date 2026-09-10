@@ -27,7 +27,7 @@ forge.log(string.format("性能档位：%s，建议扫描间隔：%dms", forge.p
 -- 例如：local portable_template = forge.asset("templates/button.png")
 
 -- forge.vision(config)：声明式实时识别 API。它不是硬编码；targets、优先级、
--- 阈值、ROI、节流和动作都由脚本配置。相同参数的目标自动走 find_first 批处理。
+-- 阈值、ROI、节流和动作都由脚本配置。相同参数的目标自动走 candidates 批处理。
 -- 声明后运行器会自动创建 on_frame；需要完全自由的逻辑时，仍可使用下方底层 API。
 if false then -- 仅展示，不与本示例后面的 on_frame 同时启用
     forge.vision {
@@ -58,6 +58,7 @@ end
 function on_frame(frame)
     -- frame.width / frame.height：当前解码帧尺寸。
     -- frame.pts_us：手机端视频时间戳（微秒）。
+    -- frame.frame_seq：解码帧序号；frame.rescan=true 表示静止画面的定时重检。
     local width, height = frame.width, frame.height
 
     -- forge.screen_size()：控制通道当前坐标尺寸，通常与 frame 尺寸相同。
@@ -76,6 +77,8 @@ function on_frame(frame)
     -- frame:find_first(paths, threshold [, roi])：批量按优先级匹配。
     -- 所有模板共享一次帧颜色转换，返回值 index 为命中的路径序号。
     -- local first = frame:find_first({"a.png", "b.png"}, 0.85, roi)
+    -- frame:find_candidates(paths, threshold [, roi])：返回每个模板的最佳命中，
+    -- 每项含 index、x、y、w、h、confidence，适合多个目标同时追踪。
 
     -- frame:find_multiscale(path, threshold [, roi])：显式多尺度全屏/ROI 搜索。
     -- 当前会测试 1x、1.5x、2x、2.5x；比单尺度更慢，应仅在尺寸未知时使用。

@@ -8,12 +8,24 @@ fn main() {
     } else {
         let include = env::var_os("OPENCV_INCLUDE_DIR")
             .map(PathBuf::from)
+            .or_else(|| {
+                ["/usr/include/opencv5", "/usr/include/opencv4"]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .find(|path| path.join("opencv2/core.hpp").is_file())
+            })
             .unwrap_or_else(|| PathBuf::from("/usr/include/opencv5"));
         let lib = env::var_os("OPENCV_LIB_DIR")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/usr/lib"));
         (include, lib)
     };
+    if !include.join("opencv2/core.hpp").is_file() {
+        panic!(
+            "OpenCV headers not found under {}; set OPENCV_INCLUDE_DIR to the directory containing opencv2/core.hpp",
+            include.display()
+        );
+    }
     cc::Build::new()
         .cpp(true)
         .std("c++17")

@@ -28,9 +28,20 @@ impl Adb {
     pub async fn output(&self, args: &[&str]) -> Result<Vec<u8>> {
         let mut command = Command::new(&self.program);
         command.args(args).stdin(Stdio::null()).kill_on_drop(true);
-        let output = command
-            .output()
+        let timeout = std::env::var("SCRCPYFORGE_ADB_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_secs(15));
+        let output = tokio::time::timeout(timeout, command.output())
             .await
+            .with_context(|| {
+                format!(
+                    "{} timed out after {} ms",
+                    self.program,
+                    timeout.as_millis()
+                )
+            })?
             .with_context(|| format!("failed to execute {}", self.program))?;
         if !output.status.success() {
             bail!(

@@ -85,8 +85,9 @@ impl GrayTemplateCache {
                 .unwrap_or(0),
         );
         if self.stamps.get(path) == Some(&stamp) {
-            if let Some(value) = self.images.get(path) {
-                return Ok(value.clone());
+            if let Some(value) = self.images.get(path).cloned() {
+                self.touch(path);
+                return Ok(value);
             }
         }
         let image = Arc::new(
@@ -94,7 +95,9 @@ impl GrayTemplateCache {
                 .with_context(|| format!("unable to load template {}", path.display()))?
                 .into_luma8(),
         );
-        if self.images.len() >= CACHE_CAPACITY {
+        let already_cached = self.images.contains_key(path);
+        self.order.retain(|item| item != path);
+        if !already_cached && self.images.len() >= CACHE_CAPACITY {
             if let Some(old) = self.order.pop_front() {
                 self.images.remove(&old);
                 self.stamps.remove(&old);
@@ -105,17 +108,28 @@ impl GrayTemplateCache {
         self.order.push_back(path.to_owned());
         Ok(image)
     }
+
+    fn touch(&mut self, path: &Path) {
+        if let Some(index) = self.order.iter().position(|item| item == path) {
+            self.order.remove(index);
+        }
+        self.order.push_back(path.to_owned());
+    }
 }
 
 #[derive(Default)]
 struct TemplateCache {
-    images: HashMap<PathBuf, Arc<Vec<RgbImage>>>,
-    stamps: HashMap<PathBuf, (u64, u128)>,
-    order: VecDeque<PathBuf>,
+    // A single-scale lookup must not pay for the resize pyramid, while a
+    // later multiscale lookup still needs its own cached representation.
+    // Keeping the mode in the key avoids returning a one-image cache entry to
+    // a multiscale caller.
+    images: HashMap<(PathBuf, bool), Arc<Vec<RgbImage>>>,
+    stamps: HashMap<(PathBuf, bool), (u64, u128)>,
+    order: VecDeque<(PathBuf, bool)>,
 }
 
 impl TemplateCache {
-    fn load_pyramid(&mut self, path: &Path) -> Result<Arc<Vec<RgbImage>>> {
+    fn load_pyramid(&mut self, path: &Path, multiscale: bool) -> Result<Arc<Vec<RgbImage>>> {
         let metadata = std::fs::metadata(path)
             .with_context(|| format!("unable to stat template {}", path.display()))?;
         let stamp = (
@@ -127,16 +141,23 @@ impl TemplateCache {
                 .map(|v| v.as_nanos())
                 .unwrap_or(0),
         );
-        if self.stamps.get(path) == Some(&stamp) {
-            if let Some(value) = self.images.get(path) {
-                return Ok(value.clone());
+        let key = (path.to_owned(), multiscale);
+        if self.stamps.get(&key) == Some(&stamp) {
+            if let Some(value) = self.images.get(&key).cloned() {
+                self.touch(&key);
+                return Ok(value);
             }
         }
         let original = image::open(path)
             .with_context(|| format!("unable to load template {}", path.display()))?
             .into_rgb8();
-        let pyramid = Arc::new(
+        let scales = if multiscale {
             AUTO_SCALES
+        } else {
+            &AUTO_SCALES[..1]
+        };
+        let pyramid = Arc::new(
+            scales
                 .iter()
                 .map(|&(num, den)| {
                     if num == den {
@@ -152,16 +173,25 @@ impl TemplateCache {
                 })
                 .collect::<Vec<_>>(),
         );
-        if self.images.len() >= CACHE_CAPACITY {
+        let already_cached = self.images.contains_key(&key);
+        self.order.retain(|item| item != &key);
+        if !already_cached && self.images.len() >= CACHE_CAPACITY {
             if let Some(old) = self.order.pop_front() {
                 self.images.remove(&old);
                 self.stamps.remove(&old);
             }
         }
-        self.images.insert(path.to_owned(), pyramid.clone());
-        self.stamps.insert(path.to_owned(), stamp);
-        self.order.push_back(path.to_owned());
+        self.images.insert(key.clone(), pyramid.clone());
+        self.stamps.insert(key.clone(), stamp);
+        self.order.push_back(key);
         Ok(pyramid)
+    }
+
+    fn touch(&mut self, key: &(PathBuf, bool)) {
+        if let Some(index) = self.order.iter().position(|item| item == key) {
+            self.order.remove(index);
+        }
+        self.order.push_back(key.clone());
     }
 }
 
@@ -188,7 +218,7 @@ pub fn find_fast(
         .get_or_init(Default::default)
         .lock()
         .unwrap()
-        .load_pyramid(path)?;
+        .load_pyramid(path, false)?;
     let image = &pyramid[0];
     let native = [NativeTemplate {
         data: image.as_raw().as_ptr(),
@@ -218,7 +248,7 @@ pub fn find_gray(
         height: image.height() as i32,
     }];
     Ok(run_native_data(
-        frame.y_plane(),
+        frame.y_plane_checked()?,
         frame.width,
         frame.height,
         frame.width,
@@ -267,7 +297,7 @@ pub fn find_first(
     let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
     let pyramids = paths
         .iter()
-        .map(|path| cache.load_pyramid(path))
+        .map(|path| cache.load_pyramid(path, false))
         .collect::<Result<Vec<_>>>()?;
     drop(cache);
     let native = pyramids
@@ -287,6 +317,38 @@ pub fn find_first(
         .map(|m| (m.template_index, m)))
 }
 
+/// Return the best candidate for every template that reaches `threshold`.
+/// Unlike `find_first`, this never lets an earlier template hide a stronger
+/// match and is the native primitive used by the per-target tracker.
+pub fn find_candidates(
+    frame: &VideoFrame,
+    paths: &[PathBuf],
+    threshold: f32,
+    roi: Option<(u32, u32, u32, u32)>,
+) -> Result<Vec<Match>> {
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
+    let pyramids = paths
+        .iter()
+        .map(|path| cache.load_pyramid(path, false))
+        .collect::<Result<Vec<_>>>()?;
+    drop(cache);
+    let native = pyramids
+        .iter()
+        .map(|pyramid| {
+            let image = &pyramid[0];
+            NativeTemplate {
+                data: image.as_raw().as_ptr(),
+                width: image.width() as i32,
+                height: image.height() as i32,
+            }
+        })
+        .collect::<Vec<_>>();
+    run_native(frame, &native, threshold, roi, true, false, 4)
+}
+
 fn find_inner(
     frame: &VideoFrame,
     path: &Path,
@@ -299,7 +361,7 @@ fn find_inner(
         .get_or_init(Default::default)
         .lock()
         .unwrap()
-        .load_pyramid(path)?;
+        .load_pyramid(path, multiscale)?;
     let selected = if multiscale {
         &pyramid[..]
     } else {
@@ -333,6 +395,27 @@ fn run_native(
     priority_first: bool,
     coarse_candidates: i32,
 ) -> Result<Vec<Match>> {
+    if let Some(requested_roi) = roi {
+        let (rgb, (x1, y1, x2, y2)) = frame.rgb_roi(requested_roi)?;
+        let mut found = run_native_data(
+            &rgb,
+            x2 - x1,
+            y2 - y1,
+            (x2 - x1) * 3,
+            native_templates,
+            threshold,
+            None,
+            best_only,
+            priority_first,
+            coarse_candidates,
+            3,
+        )?;
+        for item in &mut found {
+            item.x += x1 as i32;
+            item.y += y1 as i32;
+        }
+        return Ok(found);
+    }
     run_native_data(
         frame.rgb()?,
         frame.width,
@@ -347,6 +430,7 @@ fn run_native(
         3,
     )
 }
+#[allow(clippy::too_many_arguments)]
 fn run_native_data(
     data: &[u8],
     width: u32,
@@ -360,10 +444,16 @@ fn run_native_data(
     coarse_candidates: i32,
     channels: i32,
 ) -> Result<Vec<Match>> {
+    if !threshold.is_finite() || !(-1.0..=1.0).contains(&threshold) {
+        bail!("template threshold must be finite and between -1 and 1");
+    }
+    if native_templates.is_empty() {
+        return Ok(Vec::new());
+    }
     static CONFIGURED: OnceLock<()> = OnceLock::new();
     CONFIGURED.get_or_init(|| {
         let default = std::thread::available_parallelism()
-            .map(|v| v.get().min(8))
+            .map(|v| v.get().min(4))
             .unwrap_or(2);
         let threads = std::env::var("SCRCPYFORGE_CV_THREADS")
             .ok()
@@ -376,7 +466,14 @@ fn run_native_data(
     if x1 >= x2 || y1 >= y2 || x2 > width || y2 > height {
         bail!("invalid ROI");
     }
-    let capacity = if best_only { 1 } else { FIND_ALL_CAPACITY };
+    let capacity = if best_only {
+        // `best_only` means one result per template, not one result for the
+        // entire template set. Keeping this bounded avoids the old 4096-slot
+        // allocation while preserving every target's strongest candidate.
+        native_templates.len()
+    } else {
+        FIND_ALL_CAPACITY
+    };
     let mut output = vec![NativeMatch::default(); capacity];
     let count = unsafe {
         forge_match_template_rgb(
@@ -402,7 +499,7 @@ fn run_native_data(
     if count < 0 {
         bail!("OpenCV template matching failed with code {count}");
     }
-    output.truncate(count as usize);
+    output.truncate((count as usize).min(capacity));
     Ok(output
         .into_iter()
         .map(|item| Match {
@@ -428,12 +525,12 @@ pub fn save(frame: &VideoFrame, path: &Path) -> Result<()> {
 }
 
 pub fn crop(frame: &VideoFrame, path: &Path, roi: (u32, u32, u32, u32)) -> Result<()> {
-    let image = image::RgbImage::from_raw(frame.width, frame.height, frame.rgb()?.to_vec())
-        .context("invalid RGB frame")?;
     let (x1, y1, x2, y2) = roi;
     if x1 >= x2 || y1 >= y2 || x2 > frame.width || y2 > frame.height {
         bail!("invalid crop");
     }
+    let image = image::RgbImage::from_raw(frame.width, frame.height, frame.rgb()?.to_vec())
+        .context("invalid RGB frame")?;
     image::imageops::crop_imm(&image, x1, y1, x2 - x1, y2 - y1)
         .to_image()
         .save(path)?;
@@ -449,10 +546,14 @@ mod tests {
         let first = image::RgbImage::from_pixel(4, 4, image::Rgb([255, 0, 0]));
         first.save(&path).unwrap();
         let mut cache = TemplateCache::default();
-        assert_eq!(cache.load_pyramid(&path).unwrap()[0].width(), 4);
+        assert_eq!(cache.load_pyramid(&path, false).unwrap().len(), 1);
+        assert_eq!(
+            cache.load_pyramid(&path, true).unwrap().len(),
+            AUTO_SCALES.len()
+        );
         let second = image::RgbImage::from_pixel(5, 4, image::Rgb([0, 255, 0]));
         second.save(&path).unwrap();
-        let loaded = cache.load_pyramid(&path).unwrap();
+        let loaded = cache.load_pyramid(&path, false).unwrap();
         assert_eq!(loaded[0].width(), 5);
         assert_eq!(loaded[0].get_pixel(0, 0).0, [0, 255, 0]);
         let _ = std::fs::remove_file(path);

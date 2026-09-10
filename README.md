@@ -95,6 +95,10 @@ coexist without terminating active device sessions.
 | `SCRCPYFORGE_DATA_DIR` | platform user-data directory | Root for mutable runtime data. |
 | `SCRCPYFORGE_SCRIPTS_DIR` | `<data>/scripts` | Named Lua script packages. |
 | `SCRCPYFORGE_TEMPLATES_DIR` | `<data>/templates` | Saved image regions/templates. |
+| `SCRCPYFORGE_ADB_TIMEOUT_MS` | `15000` | Timeout for one ADB subprocess command. |
+| `SCRCPYFORGE_CV_THREADS` | host-dependent, max `4` by default | OpenCV matching thread budget. |
+| `SCRCPYFORGE_DECODE_THREADS` | host parallelism capped at `2` | FFmpeg decoder thread count per session. |
+| `SCRCPYFORGE_DECODE_THREAD_TYPE` | `slice` | FFmpeg threading mode (`slice`, `frame`, or `none`). |
 | `SCRCPYFORGE_FONT` | platform CJK font discovery | Optional UI font file. |
 | `RUST_LOG` | daemon info logs | Standard tracing filter. |
 
@@ -108,7 +112,14 @@ Each device has an independent Lua state. Frame delivery uses a replaceable
 latest-frame slot: if a callback is slower than the video stream, old pending
 frames are discarded instead of accumulating latency. Frames stay in I420 after
 decoding; RGB and JPEG are generated lazily only when vision or preview needs
-them.
+them. Static screens do not wake the frame callback unless a script explicitly
+sets a rescan interval.
+
+Declarative vision scripts keep an independent position track for each target:
+they search near the last stable center, expand the ROI after a miss, and fall
+back to a full scan for recovery. A script may opt into periodic checks of a
+static latest frame without building a historical frame queue; cooldown and
+rearm rules prevent repeated actions from a single visible instance.
 
 Script profiles (`auto`, `eco`, `balanced`, `realtime`) and preview profiles are
 configured independently. Performance depends on the host, encoder, transport,

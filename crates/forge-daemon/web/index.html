@@ -10,37 +10,190 @@ button,input,select{border:1px solid #34415a;border-radius:9px;background:#19233
 <main><div id="devices" class="grid"></div></main><dialog id="picker"><canvas id="pickerCanvas"></canvas><p id="pickerInfo">点击取坐标或拖动框选模板</p><button onclick="picker.close()">关闭</button></dialog>
 <dialog id="pairingDialog"><div class="pair-form"><h2>无线调试配对</h2><p class="hint">先在 Android 的“无线调试”中选择“使用配对码配对设备”。配对端口与连接端口通常不同。</p><label>发现的配对服务<select id="pairingService" onchange="selectPairingService()"><option value="">正在搜索…</option></select></label><div><button type="button" onclick="loadPairingServices()">重新搜索</button></div><label>配对地址<input id="pairingEndpoint" autocomplete="off" placeholder="192.168.1.10:配对端口"></label><label>六位配对码<input id="pairingCode" type="password" inputmode="numeric" autocomplete="one-time-code" maxlength="6" placeholder="000000" oninput="this.value=this.value.replace(/\D/g,'').slice(0,6)"></label><p id="pairingStatus" class="hint"></p><div class="row"><button id="pairingSubmit" type="button" onclick="pairDevice()">配对</button><button type="button" onclick="pairingDialog.close()">取消</button></div></div></dialog>
 <script>
-const api='/api/v1',streams=new Map(),modes=new Map(),choices=new Map(),frameUrls=new Map(),blank='data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg"/%3E';let scriptNames=[];
-async function json(path,opts){const r=await fetch(api+path,opts);if(!r.ok)throw Error(await r.text());return r.status===204?null:r.json()}
+const api='/api/v1';
+const streams=new Map(),modes=new Map(),choices=new Map(),frameUrls=new Map(),frameEtags=new Map(),frameSeqs=new Map(),frameFetches=new Set();
+const blank='data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg"/>';
+let scriptNames=[],activeSessionSerials=new Set(),visibleSerials=new Set();
+let previewObserver=null,observerReady=false,refreshPending=false,refreshQueued=false;
+let stateEtag=null,previewHideTimers=new Map(),eventSocket=null,eventReconnect=null,eventRefreshTimer=null;
+
+async function json(path,opts={}){
+ const r=await fetch(api+path,opts);
+ if(path==='/state'){const value=r.headers.get('etag');if(value)stateEtag=value}
+ if(r.status===304)return null;
+ if(!r.ok)throw Error(await r.text());
+ return r.status===204?null:r.json()
+}
 const post=(path,body={})=>json(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)});
 function esc(v){return String(v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
-const profileOptions=(active,prefix)=>[['auto','自动'],['eco','节能'],['balanced','均衡'],['realtime','实时']].map(([id,label])=>`<option value="${id}" ${active===id?'selected':''}>${prefix}·${label}</option>`).join('');
-async function start(serial){await post(`/sessions/${encodeURIComponent(serial)}/start`);await setMode(serial,modes.get(serial)||'realtime');refresh()}
-async function stopSession(serial){await post(`/sessions/${encodeURIComponent(serial)}/stop`);closeStream(serial);refresh()}
-function closeStream(serial){const ws=streams.get(serial);if(ws)ws.close();streams.delete(serial)}
-async function setMode(serial,mode){modes.set(serial,mode);await post(`/sessions/${encodeURIComponent(serial)}/preview-mode`,{mode});closeStream(serial);if(mode==='realtime')openStream(serial)}
-function openStream(serial){if(streams.has(serial))return;const scheme=location.protocol==='https:'?'wss':'ws',ws=new WebSocket(`${scheme}://${location.host}${api}/sessions/${encodeURIComponent(serial)}/preview`);ws.binaryType='blob';ws.onmessage=e=>{const previous=frameUrls.get(serial),url=URL.createObjectURL(e.data);frameUrls.set(serial,url);const img=document.querySelector(`[data-frame="${CSS.escape(serial)}"]`);if(img)img.src=url;if(previous)URL.revokeObjectURL(previous)};ws.onclose=()=>streams.delete(serial);streams.set(serial,ws)}
-async function refresh(){try{
- const [ds,sessions,runs]=await Promise.all([json('/devices'),json('/sessions'),json('/scripts/runs')]),activeSessions=new Set(sessions),activeRuns=new Map(runs.map(r=>[r.serial,r]));
- const metrics=new Map(await Promise.all(sessions.map(async s=>[s,await json(`/sessions/${encodeURIComponent(s)}/metrics`).catch(()=>null)])));
- status.textContent='后端运行中';status.className='ok';devices.innerHTML=ds.length?ds.map((d,i)=>card(d,i,activeSessions,activeRuns,metrics)).join(''):'<p class="empty">未发现设备</p>';
- for(const serial of sessions)if((modes.get(serial)||'realtime')==='realtime')openStream(serial);
-}catch(e){status.textContent='后端不可用：'+e.message;status.className=''}}
-function card(d,i,sessions,runs,metrics){const sr=sessions.has(d.serial),run=runs.get(d.serial),selected=choices.get(d.serial)||scriptNames[0]||'',mode=modes.get(d.serial)||'realtime',m=metrics.get(d.serial);choices.set(d.serial,selected);const q=JSON.stringify(d.serial),url=sr?(mode==='realtime'?(frameUrls.get(d.serial)||blank):mode==='five_seconds'?`${api}/sessions/${encodeURIComponent(d.serial)}/frame.jpg?t=${Date.now()}`:blank):`${api}/devices/${encodeURIComponent(d.serial)}/screenshot?t=${Date.now()}`;return `<article class="card">
- <img data-frame="${esc(d.serial)}" src="${url}" loading="lazy"><div class="row"><b>${esc(d.model||d.serial)}</b><span class="pill">${d.wireless?'无线':'USB'}</span><span class="pill ${sr?'running':'stopped'}">${sr?'● 会话运行':'○ 会话停止'}</span></div><div class="serial" title="${esc(d.serial)}">${esc(d.serial)} · ${esc(d.state)}</div>
- ${m?`<div class="metrics">近 5 秒：解码 ${m.decoded_fps.toFixed(1)} · 预览 ${m.preview_fps.toFixed(1)} · 脚本 ${m.script_fps.toFixed(1)} FPS · 帧龄 ${m.latest_frame_age_ms.toFixed(0)} ms<br>脚本 P50 ${m.script_p50_ms.toFixed(1)} / P95 ${m.script_p95_ms.toFixed(1)} ms · 丢帧 ${m.dropped_script_frames}</div>`:''}
- <div class="row">${sr?`<button onclick='stopSession(${q})'>停止会话</button>`:`<button onclick='start(${q})'>启动会话</button>`}<select onchange='setMode(${q},this.value)'>${[['realtime','实时预览'],['five_seconds','五秒一图'],['off','关闭预览']].map(([id,label])=>`<option value="${id}" ${mode===id?'selected':''}>${label}</option>`).join('')}</select>${sr?`<select title="脚本性能" onchange='setScriptProfile(${q},this.value)'>${profileOptions(m?.profile||'auto','脚本')}</select><select title="预览性能" onchange='setPreviewProfile(${q},this.value)'>${profileOptions(m?.preview_profile||'eco','预览')}</select>`:''}<button ${sr?'':'disabled'} onclick='inspectFrame(${q},"point")'>点选坐标</button><button ${sr?'':'disabled'} onclick='inspectFrame(${q},"region")'>框选模板</button></div>
- <div class="row"><select id="script-${i}" onchange='choices.set(${q},this.value)'>${scriptNames.map(n=>`<option ${n===selected?'selected':''}>${esc(n)}</option>`).join('')}</select>${run?`<span class="pill ${run.stalled?'stalled':'running'}">${run.stalled?'⚠ 疑似卡顿':'●'} ${esc(run.name||'脚本')}</span><button onclick='stopScript(${q})'>停止脚本</button>`:`<button ${sr&&selected?'':'disabled'} onclick='runOne(${q},${i})'>运行脚本</button>`}</div></article>`}
-async function scan(){await post('/devices/scan');refresh()}async function connectDevice(){const value=endpoint.value.trim();if(!/^\[?[0-9a-fA-F:.]+\]?:\d+$/.test(value)){status.textContent='请输入 IP:端口';return}try{status.textContent='正在连接 '+value;await post('/devices/connect',{endpoint:value});await refresh()}catch(e){status.textContent='连接失败：'+e.message}}
+function profileOptions(active,prefix){return [['auto','自动'],['eco','节能'],['balanced','均衡'],['realtime','实时']].map(([id,label])=>'<option value="'+id+'" '+(active===id?'selected':'')+'>'+prefix+'·'+label+'</option>').join('')}
+
+async function start(serial){await post('/sessions/'+encodeURIComponent(serial)+'/start');await setMode(serial,modes.get(serial)||'realtime');refresh()}
+async function stopSession(serial){await post('/sessions/'+encodeURIComponent(serial)+'/stop');closeStream(serial);refresh()}
+function closeStream(serial){
+ const ws=streams.get(serial);if(ws)ws.close();streams.delete(serial);
+ clearFrameUrl(serial);frameEtags.delete(serial)
+}
+function clearFrameUrl(serial){const url=frameUrls.get(serial);if(url){URL.revokeObjectURL(url);frameUrls.delete(serial)}frameEtags.delete(serial)}
+function shouldPreview(serial){return !document.hidden&&(!observerReady||visibleSerials.has(serial))}
+function syncPreviewStreams(){
+ for(const serial of [...streams.keys()]){
+  if(!activeSessionSerials.has(serial)||(modes.get(serial)||'realtime')!=='realtime'||!shouldPreview(serial))closeStream(serial)
+ }
+ for(const serial of activeSessionSerials){
+  if((modes.get(serial)||'realtime')==='realtime'&&shouldPreview(serial))openStream(serial)
+ }
+}
+function closeEvents(){
+ if(eventReconnect){clearTimeout(eventReconnect);eventReconnect=null}
+ if(eventSocket){eventSocket.close();eventSocket=null}
+}
+function scheduleEventRefresh(){
+ if(document.hidden||eventRefreshTimer)return;
+ eventRefreshTimer=setTimeout(()=>{eventRefreshTimer=null;refresh()},150)
+}
+function connectEvents(){
+ if(document.hidden||eventSocket)return;
+ const scheme=location.protocol==='https:'?'wss':'ws';
+ const ws=new WebSocket(scheme+'://'+location.host+api+'/events');
+ eventSocket=ws;
+ ws.onmessage=e=>{
+  if(eventSocket!==ws)return;
+  try{
+   const event=JSON.parse(e.data);
+   if(event.type==='script_stopped'&&event.error){status.textContent='脚本已停止：'+event.error;status.className=''}
+   if(event.type!=='script_log')scheduleEventRefresh()
+  }catch(_){scheduleEventRefresh()}
+ };
+ ws.onclose=()=>{
+  if(eventSocket!==ws)return;
+  eventSocket=null;
+  if(!document.hidden&&!eventReconnect)eventReconnect=setTimeout(()=>{eventReconnect=null;connectEvents()},5000)
+ };
+}
+async function setMode(serial,mode){
+ modes.set(serial,mode);await post('/sessions/'+encodeURIComponent(serial)+'/preview-mode',{mode});
+ closeStream(serial);syncPreviewStreams();if(mode==='five_seconds')refreshFiveSecondFrames()
+}
+function openStream(serial){
+ if(streams.has(serial)||!shouldPreview(serial))return;
+ const scheme=location.protocol==='https:'?'wss':'ws';
+ const ws=new WebSocket(scheme+'://'+location.host+api+'/sessions/'+encodeURIComponent(serial)+'/preview');
+ ws.binaryType='blob';
+ ws.onmessage=e=>{
+  if(streams.get(serial)!==ws)return;
+  const previous=frameUrls.get(serial),url=URL.createObjectURL(e.data);
+  frameUrls.set(serial,url);
+  const img=[...document.querySelectorAll('img[data-frame]')].find(item=>item.dataset.frame===serial);
+  if(img)img.src=url;
+  if(previous)URL.revokeObjectURL(previous)
+ };
+ ws.onclose=()=>{
+  if(streams.get(serial)!==ws)return;
+  streams.delete(serial);
+  const url=frameUrls.get(serial);if(url){URL.revokeObjectURL(url);frameUrls.delete(serial)}
+ };
+ streams.set(serial,ws)
+}
+function observeCards(){
+ if(previewObserver)previewObserver.disconnect();
+ visibleSerials.clear();
+ const cards=[...document.querySelectorAll('article[data-card]')];
+ if(!('IntersectionObserver' in window)){
+  observerReady=false;syncPreviewStreams();return
+ }
+ observerReady=true;
+ previewObserver=new IntersectionObserver(entries=>{
+  for(const entry of entries){
+   const serial=entry.target.dataset.serial;if(!serial)continue;
+   if(entry.isIntersecting&&entry.intersectionRatio>0){
+    visibleSerials.add(serial);
+    const timer=previewHideTimers.get(serial);if(timer){clearTimeout(timer);previewHideTimers.delete(serial)}
+   }else if(!visibleSerials.has(serial)){
+    continue
+   }else{
+    const old=previewHideTimers.get(serial);if(old)clearTimeout(old);
+    previewHideTimers.set(serial,setTimeout(()=>{
+     visibleSerials.delete(serial);previewHideTimers.delete(serial);syncPreviewStreams()
+    },3000))
+   }
+  }
+  syncPreviewStreams()
+ },{threshold:0.01});
+ cards.forEach(card=>previewObserver.observe(card))
+}
+async function refresh(){
+ if(refreshPending){refreshQueued=true;return}
+ refreshPending=true;
+ try{
+  const options=stateEtag?{headers:{'if-none-match':stateEtag}}:{};
+  const snapshot=await json('/state',options);
+  if(!snapshot){syncPreviewStreams();return}
+  const ds=snapshot.devices||[],sessions=(snapshot.sessions||[]).map(s=>s.serial),runs=snapshot.runs||[];
+  scriptNames=snapshot.scripts||[];
+  activeSessionSerials=new Set(sessions);
+  const activeRuns=new Map(runs.map(r=>[r.serial,r])),metrics=new Map((snapshot.sessions||[]).map(s=>[s.serial,s.metrics]));
+  for(const [serial,m] of metrics)frameSeqs.set(serial,Number(m.latest_frame_seq||0));
+  for(const serial of [...frameSeqs.keys()])if(!activeSessionSerials.has(serial))frameSeqs.delete(serial);
+  for(const serial of [...frameUrls.keys()])if(!activeSessionSerials.has(serial))clearFrameUrl(serial);
+  for(const serial of [...frameEtags.keys()])if(!activeSessionSerials.has(serial))frameEtags.delete(serial);
+  status.textContent='后端运行中';status.className='ok';
+  devices.innerHTML=ds.length?ds.map((d,i)=>card(d,i,activeSessionSerials,activeRuns,metrics)).join(''):'<p class="empty">未发现设备</p>';
+  observeCards();syncPreviewStreams()
+ }catch(e){status.textContent='后端不可用：'+e.message;status.className=''}
+ finally{refreshPending=false;if(refreshQueued){refreshQueued=false;refresh()}}
+}
+function card(d,i,sessions,runs,metrics){
+ const sr=sessions.has(d.serial),run=runs.get(d.serial),selected=choices.get(d.serial)||scriptNames[0]||'';
+ const mode=modes.get(d.serial)||'realtime',m=metrics.get(d.serial);choices.set(d.serial,selected);
+ const q=esc(JSON.stringify(d.serial)),seq=Number(m?.latest_frame_seq||frameSeqs.get(d.serial)||0);
+ const url=sr?(mode==='realtime'?(frameUrls.get(d.serial)||blank):mode==='five_seconds'?(frameUrls.get(d.serial)||api+'/sessions/'+encodeURIComponent(d.serial)+'/frame.jpg?seq='+seq):blank):api+'/devices/'+encodeURIComponent(d.serial)+'/screenshot?t='+Date.now();
+ const metricHtml=m?'<div class="metrics">近 5 秒：解码 '+Number(m.decoded_fps||0).toFixed(1)+' · 预览 '+Number(m.preview_fps||0).toFixed(1)+' · 脚本 '+Number(m.script_fps||0).toFixed(1)+' FPS · 帧龄 '+Number(m.latest_frame_age_ms||0).toFixed(0)+' ms<br>脚本 P50 '+Number(m.script_p50_ms||0).toFixed(1)+' / P95 '+Number(m.script_p95_ms||0).toFixed(1)+' ms · 丢帧 '+(m.dropped_script_frames||0)+' · 预览丢帧 '+(m.preview_dropped_frames||0)+' · 重检 '+(m.script_rescans||0)+'<br>发布 '+(m.last_publish_us||0)+'μs · 输入 '+(m.last_input_us||0)+'μs · 视频错误 '+((m.video_packet_errors||0)+(m.video_decode_errors||0))+' · 活动 '+esc(m.activity_state||'unknown')+' · 租约 '+(m.preview_leases||0)+'</div>':'';
+ const sessionButtons=sr?'<button onclick=\'stopSession('+q+')\'>停止会话</button>':'<button onclick=\'start('+q+')\'>启动会话</button>';
+ const profileButtons=sr?'<select title="脚本性能" onchange=\'setScriptProfile('+q+',this.value)\'>'+profileOptions(m?.profile||'auto','脚本')+'</select><select title="预览性能" onchange=\'setPreviewProfile('+q+',this.value)\'>'+profileOptions(m?.preview_profile||'eco','预览')+'</select>':'';
+ const inspectButtons='<button '+(sr?'':'disabled')+' onclick=\'inspectFrame('+q+',"point")\'>点选坐标</button><button '+(sr?'':'disabled')+' onclick=\'inspectFrame('+q+',"region")\'>框选模板</button>';
+ const scriptOptions=scriptNames.map(n=>'<option value="'+esc(n)+'" '+(n===selected?'selected':'')+'>'+esc(n)+'</option>').join('');
+ const runHtml=run?'<span class="pill '+(run.stalled?'stalled':'running')+'">'+(run.stalled?'⚠ 疑似卡顿':'●')+' '+esc(run.name||'脚本')+'</span><button onclick=\'stopScript('+q+')\'>停止脚本</button>':'<button '+(sr&&selected?'':'disabled')+' onclick=\'runOne('+q+','+i+')\'>运行脚本</button>';
+ return '<article class="card" data-card="1" data-serial="'+esc(d.serial)+'"><img data-frame="'+esc(d.serial)+'" src="'+esc(url)+'" loading="lazy"><div class="row"><b>'+esc(d.model||d.serial)+'</b><span class="pill">'+(d.wireless?'无线':'USB')+'</span><span class="pill '+(sr?'running':'stopped')+'">'+(sr?'● 会话运行':'○ 会话停止')+'</span></div><div class="serial" title="'+esc(d.serial)+'">'+esc(d.serial)+' · '+esc(d.state)+'</div>'+metricHtml+'<div class="row">'+sessionButtons+'<select onchange=\'setMode('+q+',this.value)\'>'+[['realtime','实时预览'],['five_seconds','五秒一图'],['off','关闭预览']].map(([id,label])=>'<option value="'+id+'" '+(mode===id?'selected':'')+'>'+label+'</option>').join('')+'</select>'+profileButtons+inspectButtons+'</div><div class="row"><select id="script-'+i+'" onchange=\'choices.set('+q+',this.value)\'>'+scriptOptions+'</select>'+runHtml+'</div></article>'
+}
+async function scan(){await post('/devices/scan');refresh()}
+async function connectDevice(){const value=endpoint.value.trim();if(!/^\[?[0-9a-fA-F:.]+\]?:\d+$/.test(value)){status.textContent='请输入 IP:端口';return}try{status.textContent='正在连接 '+value;await post('/devices/connect',{endpoint:value});await refresh()}catch(e){status.textContent='连接失败：'+e.message}}
 function validEndpoint(value){return /^\[?[0-9a-fA-F:.]+\]?:\d+$/.test(value)}
 async function openPairing(){pairingCode.value='';pairingStatus.className='hint';pairingStatus.textContent='正在搜索附近的配对服务…';pairingDialog.showModal();await loadPairingServices();pairingCode.focus()}
-async function loadPairingServices(){pairingService.disabled=true;pairingStatus.className='hint';pairingStatus.textContent='正在搜索附近的配对服务…';try{const services=await json('/devices/pairing-services');pairingService.replaceChildren();for(const service of services){const option=document.createElement('option');option.value=service.endpoint;option.textContent=`${service.name} · ${service.endpoint}`;pairingService.append(option)}const manual=document.createElement('option');manual.value='';manual.textContent='手动输入配对地址';pairingService.append(manual);if(services.length){pairingService.value=services[0].endpoint;pairingEndpoint.value=services[0].endpoint;pairingStatus.textContent=`发现 ${services.length} 个配对服务`}else{pairingService.value='';pairingStatus.textContent='未自动发现设备，请手动输入手机显示的 IP 和配对端口'}}catch(e){pairingStatus.className='error';pairingStatus.textContent='搜索失败：'+e.message}finally{pairingService.disabled=false}}
+async function loadPairingServices(){pairingService.disabled=true;pairingStatus.className='hint';pairingStatus.textContent='正在搜索附近的配对服务…';try{const services=await json('/devices/pairing-services');pairingService.replaceChildren();for(const service of services){const option=document.createElement('option');option.value=service.endpoint;option.textContent=service.name+' · '+service.endpoint;pairingService.append(option)}const manual=document.createElement('option');manual.value='';manual.textContent='手动输入配对地址';pairingService.append(manual);if(services.length){pairingService.value=services[0].endpoint;pairingEndpoint.value=services[0].endpoint;pairingStatus.textContent='发现 '+services.length+' 个配对服务'}else{pairingService.value='';pairingStatus.textContent='未自动发现设备，请手动输入手机显示的 IP 和配对端口'}}catch(e){pairingStatus.className='error';pairingStatus.textContent='搜索失败：'+e.message}finally{pairingService.disabled=false}}
 function selectPairingService(){if(pairingService.value)pairingEndpoint.value=pairingService.value}
 async function pairDevice(){const address=pairingEndpoint.value.trim(),code=pairingCode.value.trim();if(!validEndpoint(address)){pairingStatus.className='error';pairingStatus.textContent='请输入手机显示的 IP:配对端口';return}if(!/^\d{6}$/.test(code)){pairingStatus.className='error';pairingStatus.textContent='配对码必须是六位数字';return}pairingSubmit.disabled=true;pairingStatus.className='hint';pairingStatus.textContent='正在配对并查找连接端口…';try{await post('/devices/pair',{endpoint:address,code});pairingCode.value='';pairingDialog.close();status.textContent='配对成功';status.className='ok';await refresh()}catch(e){pairingStatus.className='error';pairingStatus.textContent='配对失败：'+e.message}finally{pairingCode.value='';pairingSubmit.disabled=false}}
-async function setScriptProfile(serial,profile){await post(`/sessions/${encodeURIComponent(serial)}/script-profile`,{profile})}async function setPreviewProfile(serial,profile){await post(`/sessions/${encodeURIComponent(serial)}/preview-profile`,{profile})}
-async function loadScripts(){scriptNames=await json('/scripts');refresh()}async function runOne(serial,i){const name=document.getElementById(`script-${i}`).value;choices.set(serial,name);await post('/scripts/run-named',{serial,name});refresh()}async function stopScript(serial){await post(`/scripts/devices/${encodeURIComponent(serial)}/stop`);refresh()}async function stopAllScripts(){await post('/scripts/stop-all');refresh()}
-async function startSessions(){await post('/sessions/start-all');refresh()}async function stopSessions(){await post('/sessions/stop-all');for(const key of [...streams.keys()])closeStream(key);refresh()}
-async function inspectFrame(serial,mode){const img=new Image();img.src=`${api}/sessions/${encodeURIComponent(serial)}/frame.jpg?t=${Date.now()}`;await img.decode();const c=pickerCanvas;c.width=img.naturalWidth;c.height=img.naturalHeight;c.getContext('2d').drawImage(img,0,0);let start=null;const point=e=>{const r=c.getBoundingClientRect();return[Math.round((e.clientX-r.left)*c.width/r.width),Math.round((e.clientY-r.top)*c.height/r.height)]};c.onpointerdown=e=>start=point(e);c.onpointerup=async e=>{const end=point(e);if(mode==='point'){pickerInfo.textContent=`设备 ${serial} · 坐标 (${end[0]}, ${end[1]})`;return}if(!start)return;const[x1,x2]=[start[0],end[0]].sort((a,b)=>a-b),[y1,y2]=[start[1],end[1]].sort((a,b)=>a-b);if(x2<=x1||y2<=y1)return;const safe=serial.replace(/[^A-Za-z0-9_-]/g,'_'),path=prompt('保存位置（相对模板目录或绝对路径）',`${safe}-template.png`);if(path){const result=await post(`/sessions/${encodeURIComponent(serial)}/regions`,{path,x1,y1,x2,y2});pickerInfo.textContent=`设备 ${serial} · 区域 (${x1},${y1})-(${x2},${y2}) · 已保存 ${result.path}`}};pickerInfo.textContent=mode==='point'?`设备 ${serial}：点击画面获取坐标`:`设备 ${serial}：拖动框选模板区域`;picker.showModal()}
-document.addEventListener('visibilitychange',()=>{if(document.hidden){for(const serial of [...streams.keys()])closeStream(serial)}else{refresh()}});
-loadScripts();setInterval(()=>{if(!document.hidden)refresh()},5000);
+async function setScriptProfile(serial,profile){await post('/sessions/'+encodeURIComponent(serial)+'/script-profile',{profile})}
+async function setPreviewProfile(serial,profile){await post('/sessions/'+encodeURIComponent(serial)+'/preview-profile',{profile})}
+async function refreshFiveSecondFrames(){
+ if(document.hidden)return;
+ const jobs=[];
+ for(const [serial,mode] of modes){
+  if(mode==='five_seconds'&&activeSessionSerials.has(serial)&&shouldPreview(serial)&&!frameFetches.has(serial))jobs.push(updateFiveSecondFrame(serial))
+ }
+ await Promise.allSettled(jobs)
+}
+async function updateFiveSecondFrame(serial){
+ frameFetches.add(serial);
+ try{
+  const headers={},etag=frameEtags.get(serial);if(etag)headers['if-none-match']=etag;
+  const response=await fetch(api+'/sessions/'+encodeURIComponent(serial)+'/frame.jpg',{headers,cache:'no-store'});
+  const stillFiveSecond=()=>modes.get(serial)==='five_seconds'&&activeSessionSerials.has(serial)&&shouldPreview(serial);
+  const next=response.headers.get('etag');if(next&&stillFiveSecond())frameEtags.set(serial,next);
+  if(response.status===304||!response.ok)return;
+  const blob=await response.blob(),url=URL.createObjectURL(blob),previous=frameUrls.get(serial);const img=[...document.querySelectorAll('img[data-frame]')].find(item=>item.dataset.frame===serial);
+  if(img&&stillFiveSecond()){frameUrls.set(serial,url);img.src=url;if(previous)URL.revokeObjectURL(previous)}else{URL.revokeObjectURL(url)}
+ }catch(_){
+ }finally{frameFetches.delete(serial)}
+}
+async function loadScripts(){await refresh()}
+async function runOne(serial,i){const name=document.getElementById('script-'+i).value;choices.set(serial,name);await post('/scripts/run-named',{serial,name});refresh()}
+async function stopScript(serial){await post('/scripts/devices/'+encodeURIComponent(serial)+'/stop');refresh()}
+async function stopAllScripts(){await post('/scripts/stop-all');refresh()}
+async function startSessions(){await post('/sessions/start-all');refresh()}
+async function stopSessions(){await post('/sessions/stop-all');for(const key of [...streams.keys()])closeStream(key);activeSessionSerials.clear();refresh()}
+async function inspectFrame(serial,mode){const img=new Image(),seq=frameSeqs.get(serial)||Date.now();img.src=api+'/sessions/'+encodeURIComponent(serial)+'/frame.jpg?seq='+seq;await img.decode();const c=pickerCanvas;c.width=img.naturalWidth;c.height=img.naturalHeight;c.getContext('2d').drawImage(img,0,0);let start=null;const point=e=>{const r=c.getBoundingClientRect();return[Math.round((e.clientX-r.left)*c.width/r.width),Math.round((e.clientY-r.top)*c.height/r.height)]};c.onpointerdown=e=>start=point(e);c.onpointerup=async e=>{const end=point(e);if(mode==='point'){pickerInfo.textContent='设备 '+serial+' · 坐标 ('+end[0]+', '+end[1]+')';return}if(!start)return;const[x1,x2]=[start[0],end[0]].sort((a,b)=>a-b),[y1,y2]=[start[1],end[1]].sort((a,b)=>a-b);if(x2<=x1||y2<=y1)return;const safe=serial.replace(/[^A-Za-z0-9_-]/g,'_'),path=prompt('保存位置（模板目录内的相对 PNG 路径）',safe+'-template.png');if(path){const result=await post('/sessions/'+encodeURIComponent(serial)+'/regions',{path,x1,y1,x2,y2});pickerInfo.textContent='设备 '+serial+' · 区域 ('+x1+','+y1+')-('+x2+','+y2+') · 已保存 '+result.path}};pickerInfo.textContent=mode==='point'?'设备 '+serial+'：点击画面获取坐标':'设备 '+serial+'：拖动框选模板区域';picker.showModal()}
+document.addEventListener('visibilitychange',()=>{if(document.hidden){for(const serial of [...streams.keys()])closeStream(serial);for(const serial of [...frameUrls.keys()])clearFrameUrl(serial);closeEvents()}else{refresh();refreshFiveSecondFrames();connectEvents();syncPreviewStreams()}});
+window.addEventListener('beforeunload',()=>{for(const serial of [...streams.keys()])closeStream(serial);closeEvents()});
+loadScripts();connectEvents();setInterval(()=>{if(!document.hidden){refreshFiveSecondFrames();if(!activeSessionSerials.size)refresh()}},5000);setInterval(()=>{if(!document.hidden)refresh()},30000);
 </script></body></html>

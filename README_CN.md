@@ -90,6 +90,10 @@ curl -X POST http://127.0.0.1:27180/api/v1/sessions/DEVICE_SERIAL/start \
 | `SCRCPYFORGE_DATA_DIR` | 平台用户数据目录 | 可变运行数据根目录。 |
 | `SCRCPYFORGE_SCRIPTS_DIR` | `<数据目录>/scripts` | 命名 Lua 脚本包目录。 |
 | `SCRCPYFORGE_TEMPLATES_DIR` | `<数据目录>/templates` | 保存的截图区域/模板目录。 |
+| `SCRCPYFORGE_ADB_TIMEOUT_MS` | `15000` | 单次 ADB 子进程命令超时（毫秒）。 |
+| `SCRCPYFORGE_CV_THREADS` | 依主机而定，默认最多 `4` | OpenCV 模板匹配线程预算。 |
+| `SCRCPYFORGE_DECODE_THREADS` | 主机并行度，最多 `2` | 每个会话的 FFmpeg 解码线程数。 |
+| `SCRCPYFORGE_DECODE_THREAD_TYPE` | `slice` | FFmpeg 线程模式：`slice`、`frame` 或 `none`。 |
 | `SCRCPYFORGE_FONT` | 自动查找平台中文字体 | 可选的界面字体文件。 |
 | `RUST_LOG` | 后端 info 日志 | 标准 tracing 日志过滤器。 |
 
@@ -101,7 +105,12 @@ curl -X POST http://127.0.0.1:27180/api/v1/sessions/DEVICE_SERIAL/start \
 
 每台设备拥有独立 Lua 状态。画面通过可替换的“最新帧槽”传递：回调速度低于视频
 帧率时，旧的待处理帧会被丢弃，不会堆积延迟。画面解码后保持 I420，仅在视觉识别
-或预览需要时延迟生成 RGB/JPEG。
+或预览需要时延迟生成 RGB/JPEG。静止画面默认不会唤醒帧回调；脚本显式设置
+`rescan_interval_ms` 后才会按配置重检。
+
+声明式视觉脚本为每个目标独立记忆位置：先在上次稳定中心附近匹配，局部失败后扩大
+ROI，继续失败则回退全屏。脚本可选择用最新帧低频重检静止画面，不建立历史帧队列；
+冷却和消失重触发规则避免同一个持续可见目标重复点击。
 
 脚本档位（`auto`、`eco`、`balanced`、`realtime`）和预览档位分别配置。性能取决于
 主机、设备编码器、传输方式、画面尺寸、模板和场景；编译或运行时均不会选择针对
