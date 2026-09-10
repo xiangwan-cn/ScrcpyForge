@@ -253,13 +253,14 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &Context, _: &mut eframe::Frame) {
-        self.receive(ctx);
+    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        self.receive(&ctx);
         if !self.pairing_busy && self.last_tick.elapsed() > Duration::from_secs(2) {
             let _ = self.commands.send(Command::Refresh);
             self.last_tick = Instant::now();
         }
-        egui::TopBottomPanel::top("header").show(ctx, |ui| {
+        egui::Frame::NONE.show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 ui.heading("ScrcpyForge");
@@ -282,6 +283,7 @@ impl eframe::App for App {
                 ui.label("无线设备");
                 let edit = ui.add(
                     egui::TextEdit::singleline(&mut self.endpoint)
+                        .id_source("wireless-endpoint")
                         .hint_text("192.168.1.10:端口")
                         .desired_width(220.0),
                 );
@@ -311,7 +313,7 @@ impl eframe::App for App {
                 .collapsible(false)
                 .resizable(false)
                 .default_width(420.0)
-                .show(ctx, |ui| {
+                .show(&ctx, |ui| {
                     ui.label("先在 Android 的“无线调试”中选择“使用配对码配对设备”。");
                     ui.small("配对端口与连接端口通常不同，成功后会自动查找连接端口。");
                     ui.add_space(8.0);
@@ -351,6 +353,7 @@ impl eframe::App for App {
                     ui.add_enabled(
                         !self.pairing_busy,
                         egui::TextEdit::singleline(&mut self.pairing_endpoint)
+                            .id_source("pairing-endpoint")
                             .hint_text("192.168.1.10:配对端口")
                             .desired_width(390.0),
                     );
@@ -358,6 +361,7 @@ impl eframe::App for App {
                     ui.add_enabled(
                         !self.pairing_busy,
                         egui::TextEdit::singleline(&mut self.pairing_code)
+                            .id_source("pairing-code")
                             .password(true)
                             .char_limit(6)
                             .hint_text("000000")
@@ -402,7 +406,7 @@ impl eframe::App for App {
             }
             self.pairing_open &= open;
         }
-        egui::CentralPanel::default().show(ctx,|ui|{egui::ScrollArea::vertical().show(ui,|ui|{if self.devices.is_empty(){ui.vertical_centered(|ui|{ui.add_space(80.0);ui.heading("未发现设备");ui.label("请连接 USB 或无线 ADB 设备");});return;}
+        egui::Frame::central_panel(ui.style()).show(ui,|ui|{egui::ScrollArea::vertical().show(ui,|ui|{if self.devices.is_empty(){ui.vertical_centered(|ui|{ui.add_space(80.0);ui.heading("未发现设备");ui.label("请连接 USB 或无线 ADB 设备");});return;}
    let columns=if ui.available_width()<620.0{1}else if ui.available_width()<980.0{2}else{3};let width=(ui.available_width()-12.0*(columns-1)as f32)/columns as f32;
    for row in self.devices.chunks(columns){ui.horizontal_top(|ui|{for device in row{let serial=&device.serial;let session_running=self.sessions.contains(serial);let run=self.runs.get(serial);
     ui.allocate_ui_with_layout(egui::vec2(width,ui.available_height()),egui::Layout::top_down(egui::Align::Center),|ui|{egui::Frame::group(ui.style()).show(ui,|ui|{ui.set_width(width-16.0);let aspect=self.textures.get(serial).map(|t|t.aspect_ratio()).unwrap_or(0.5);let h=((width-24.0)/aspect).min(520.0);
@@ -413,7 +417,7 @@ impl eframe::App for App {
      ui.horizontal_wrapped(|ui|{if !session_running{if ui.button("启动会话").clicked(){let _=self.commands.send(Command::StartSession(serial.clone()));}}else if ui.button("停止会话").clicked(){let _=self.commands.send(Command::StopSession(serial.clone()));}let mode=self.modes.entry(serial.clone()).or_insert(Mode::Realtime);egui::ComboBox::from_id_salt(format!("mode-{serial}")).selected_text(match mode{Mode::Realtime=>"实时预览",Mode::FiveSeconds=>"五秒一图",Mode::Off=>"关闭预览"}).show_ui(ui,|ui|{for(value,label)in[(Mode::Realtime,"实时预览"),(Mode::FiveSeconds,"五秒一图"),(Mode::Off,"关闭预览")]{if ui.selectable_value(mode,value,label).changed(){let _=self.commands.send(Command::SetMode(serial.clone(),value));}}});});
      if let Some(metric)=self.metrics.get(serial){ui.small(format!("解码 {:.1} · 预览 {:.1} · 脚本 {:.1} FPS｜均值 {:.1}ms · P50 {:.1} · P95 {:.1} · 丢帧 {}",metric.decoded_fps,metric.preview_fps,metric.script_fps,metric.average_script_ms,metric.script_p50_ms,metric.script_p95_ms,metric.dropped_script_frames));ui.horizontal_wrapped(|ui|{let mut script_profile=metric.profile.clone();egui::ComboBox::from_id_salt(format!("script-profile-{serial}")).selected_text(format!("脚本：{}",script_profile)).show_ui(ui,|ui|{for(value,label)in[("auto","自动"),("eco","节能"),("balanced","均衡"),("realtime","实时")]{if ui.selectable_value(&mut script_profile,value.to_owned(),label).changed(){let _=self.commands.send(Command::SetScriptProfile(serial.clone(),value.to_owned()));}}});let mut preview_profile=metric.preview_profile.clone();egui::ComboBox::from_id_salt(format!("preview-profile-{serial}")).selected_text(format!("预览：{}",preview_profile)).show_ui(ui,|ui|{for(value,label)in[("auto","自动"),("eco","节能"),("balanced","均衡"),("realtime","实时")]{if ui.selectable_value(&mut preview_profile,value.to_owned(),label).changed(){let _=self.commands.send(Command::SetPreviewProfile(serial.clone(),value.to_owned()));}}});});}
      ui.horizontal_wrapped(|ui|{let inspect=self.inspect.entry(serial.clone()).or_insert(Inspect::None);if ui.selectable_label(*inspect==Inspect::Point,"点选坐标").clicked(){*inspect=if *inspect==Inspect::Point{Inspect::None}else{Inspect::Point};}if ui.selectable_label(*inspect==Inspect::Region,"框选模板").clicked(){*inspect=if *inspect==Inspect::Region{Inspect::None}else{Inspect::Region};}if let Some((x,y))=self.points.get(serial){ui.label(format!("坐标：{x}, {y}"));}});
-     ui.horizontal(|ui|{ui.label("保存位置");ui.text_edit_singleline(self.paths.entry(serial.clone()).or_insert_with(||default_template_name(serial)));});
+     ui.horizontal(|ui|{ui.label("保存位置");ui.add(egui::TextEdit::singleline(self.paths.entry(serial.clone()).or_insert_with(||default_template_name(serial))).id_source(("template-path",serial)));});
      ui.separator();ui.horizontal_wrapped(|ui|{let default=self.scripts.first().cloned().unwrap_or_default();let choice=self.selected.entry(serial.clone()).or_insert(default);egui::ComboBox::from_id_salt(format!("script-{serial}")).selected_text(if choice.is_empty(){"无可用脚本"}else{choice.as_str()}).show_ui(ui,|ui|{for name in &self.scripts{ui.selectable_value(choice,name.clone(),name);}});if let Some(active)=run{ui.colored_label(if active.stalled{egui::Color32::LIGHT_RED}else{egui::Color32::LIGHT_GREEN},format!("{} {}",if active.stalled{"⚠ 疑似卡顿"}else{"●"},active.name.as_deref().unwrap_or("脚本"))).on_hover_text(format!("运行 ID: {}",active.run_id));if ui.button("停止脚本").clicked(){let _=self.commands.send(Command::StopScript(serial.clone()));}}else{let enabled=session_running&&!choice.is_empty();if ui.add_enabled(enabled,egui::Button::new("运行脚本")).clicked(){let _=self.commands.send(Command::RunScript(serial.clone(),choice.clone()));}}});
     });});}});ui.add_space(10.0);}
   });});
@@ -429,6 +433,8 @@ fn configure(ctx: &Context) {
             [
                 "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                "/usr/share/fonts/droid-nonlatin/DroidSansFallbackFull.ttf",
+                "/usr/share/fonts/droid-nonlatin/DroidSansFallback.ttf",
                 "/System/Library/Fonts/PingFang.ttc",
                 "C:\\Windows\\Fonts\\msyh.ttc",
             ]
@@ -497,6 +503,7 @@ fn spawn_backend(
     thread::spawn(move || {
         let api = std::env::var("SCRCPYFORGE_API").unwrap_or_else(|_| DEFAULT_API.into());
         let client = reqwest::blocking::Client::builder()
+            .no_proxy()
             .timeout(Duration::from_secs(15))
             .build()
             .unwrap();

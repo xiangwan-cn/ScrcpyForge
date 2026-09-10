@@ -2,7 +2,21 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 api=${SCRCPYFORGE_API:-http://127.0.0.1:27180/api/v1}
-if ! curl --silent --fail --max-time 1 "$api/health" >/dev/null 2>&1; then
+if [ -z "${SCRCPYFORGE_FONT:-}" ]; then
+    for font in \
+        /usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc \
+        /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc \
+        /usr/share/fonts/droid-nonlatin/DroidSansFallbackFull.ttf \
+        /usr/share/fonts/droid-nonlatin/DroidSansFallback.ttf
+    do
+        if [ -f "$font" ]; then
+            SCRCPYFORGE_FONT=$font
+            export SCRCPYFORGE_FONT
+            break
+        fi
+    done
+fi
+if ! curl --noproxy '*' --silent --fail --max-time 1 "$api/health" >/dev/null 2>&1; then
     "$root/tools/run-forge-daemon" >>"${XDG_RUNTIME_DIR:-/tmp}/scrcpyforge-daemon.log" 2>&1 &
 fi
 exec "$root/target/release/forge-desktop" "$@"

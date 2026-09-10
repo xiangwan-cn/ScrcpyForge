@@ -23,12 +23,6 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", lib.display());
     println!("cargo:rustc-link-lib=dylib=opencv_core");
     println!("cargo:rustc-link-lib=dylib=opencv_imgproc");
-    println!("cargo:rustc-link-lib=dylib=opencv_geometry");
-    println!("cargo:rustc-link-lib=dylib=opencv_calib");
-    println!("cargo:rustc-link-lib=dylib=opencv_flann");
-    println!("cargo:rustc-link-lib=dylib=lapack");
-    println!("cargo:rustc-link-lib=dylib=cblas");
-    println!("cargo:rustc-link-lib=dylib=blas");
     if local.exists() {
         println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
     }

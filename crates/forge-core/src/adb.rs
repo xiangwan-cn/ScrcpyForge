@@ -214,7 +214,7 @@ fn discover_adb_mdns(service_type: &str) -> Result<Vec<PairingService>> {
     let daemon = ServiceDaemon::new()?;
     let service_fullname = format!("{service_type}.local.");
     let receiver = daemon.browse(&service_fullname)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(1200);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
     let mut services = Vec::new();
     while std::time::Instant::now() < deadline {
         match receiver.recv_timeout(std::time::Duration::from_millis(200)) {

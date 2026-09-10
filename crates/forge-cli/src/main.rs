@@ -23,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
         "http://{}/api/v1",
         std::env::var("SCRCPYFORGE_ADDR").unwrap_or_else(|_| "127.0.0.1:27180".into())
     );
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().no_proxy().build()?;
     let value: Option<serde_json::Value> = match args.command {
         Command::Health => Some(
             client
