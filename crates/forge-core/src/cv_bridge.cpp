@@ -93,12 +93,12 @@ int32_t forge_match_template_rgb(
     const uint8_t *rgb_data, int32_t width, int32_t height, int32_t stride,
     int32_t channels, const ForgeTemplate *templates, int32_t template_count,
     int32_t x1, int32_t y1, int32_t x2, int32_t y2, float threshold,
-    bool best_only, bool priority_first, int32_t coarse_candidates,
+    uint8_t best_only, uint8_t priority_first, int32_t coarse_candidates,
     ForgeMatch *output, int32_t capacity) {
   try {
     if (!rgb_data || !templates || !output || width <= 0 || height <= 0 ||
         template_count <= 0 || capacity <= 0 || !std::isfinite(threshold) ||
-        threshold < -1.0f || threshold > 1.0f || x1 < 0 || y1 < 0 ||
+        threshold < 0.0f || threshold > 1.0f || x1 < 0 || y1 < 0 ||
         x2 > width || y2 > height || x1 >= x2 || y1 >= y2)
       return -1;
     if (channels != 1 && channels != 3)
@@ -112,7 +112,7 @@ int32_t forge_match_template_rgb(
     cv::Mat search = image(cv::Rect(x1, y1, x2 - x1, y2 - y1));
     constexpr int coarse_scale = 3;
     thread_local cv::Mat coarse_search, coarse_templ, coarse_scores, scores;
-    if (best_only) {
+    if (best_only != 0) {
       cv::resize(search, coarse_search,
                  cv::Size(std::max(2, search.cols / coarse_scale),
                           std::max(2, search.rows / coarse_scale)),
@@ -205,7 +205,7 @@ int32_t forge_match_template_rgb(
           }
         }
         if (std::isfinite(best_score) && best_score >= threshold) {
-          if (priority_first) {
+          if (priority_first != 0) {
             output[0] = best;
             return 1;
           }
@@ -224,10 +224,18 @@ int32_t forge_match_template_rgb(
           found.push_back({point.x + x1 + item.width / 2,
                            point.y + y1 + item.height / 2, item.width,
                            item.height, static_cast<float>(score), i});
-          const int sx = std::max(0, point.x - item.width / 2);
-          const int sy = std::max(0, point.y - item.height / 2);
-          const int sw = std::min(scores.cols - sx, item.width);
-          const int sh = std::min(scores.rows - sy, item.height);
+          // Suppress every top-left candidate whose box overlaps this match.
+          // The score map stores top-left coordinates, so the suppression
+          // window spans one template width/height on either side rather than
+          // being centered on the pixel itself. This is the rectangular form
+          // of template-level IoU NMS and avoids duplicate clicks on a single
+          // control.
+          const int sx = std::max(0, point.x - item.width + 1);
+          const int sy = std::max(0, point.y - item.height + 1);
+          const int ex = std::min(scores.cols, point.x + item.width);
+          const int ey = std::min(scores.rows, point.y + item.height);
+          const int sw = ex - sx;
+          const int sh = ey - sy;
           if (sw > 0 && sh > 0)
             scores(cv::Rect(sx, sy, sw, sh)).setTo(-1.0f);
         }

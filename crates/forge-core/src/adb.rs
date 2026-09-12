@@ -1,15 +1,23 @@
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc,
+};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
 
 use crate::{DeviceInfo, DeviceState, InputAction, PairingService};
 
 const CONNECT_SERVICE: &str = "_adb-tls-connect._tcp";
 const PAIRING_SERVICE: &str = "_adb-tls-pairing._tcp";
+const MAX_ADB_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ADB_ERROR_BYTES: usize = 8 * 1024;
+const MAX_DEVICES: usize = 1024;
+const MAX_MDNS_SERVICES: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct Adb {
@@ -27,13 +35,21 @@ impl Default for Adb {
 impl Adb {
     pub async fn output(&self, args: &[&str]) -> Result<Vec<u8>> {
         let mut command = Command::new(&self.program);
-        command.args(args).stdin(Stdio::null()).kill_on_drop(true);
+        command
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
         let timeout = std::env::var("SCRCPYFORGE_ADB_TIMEOUT_MS")
             .ok()
             .and_then(|value| value.parse::<u64>().ok())
             .map(Duration::from_millis)
             .unwrap_or_else(|| Duration::from_secs(15));
-        let output = tokio::time::timeout(timeout, command.output())
+        let child = command
+            .spawn()
+            .with_context(|| format!("failed to execute {}", self.program))?;
+        let output = tokio::time::timeout(timeout, wait_child_output_limited(child))
             .await
             .with_context(|| {
                 format!(
@@ -41,15 +57,12 @@ impl Adb {
                     self.program,
                     timeout.as_millis()
                 )
-            })?
-            .with_context(|| format!("failed to execute {}", self.program))?;
-        if !output.status.success() {
-            bail!(
-                "adb failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            })??;
+        let (status, stdout, stderr) = output;
+        if !status.success() {
+            bail!("adb failed: {}", bounded_diagnostic(&stderr));
         }
-        Ok(output.stdout)
+        Ok(stdout)
     }
 
     pub async fn devices(&self) -> Result<Vec<DeviceInfo>> {
@@ -57,11 +70,13 @@ impl Adb {
         Ok(String::from_utf8_lossy(&bytes)
             .lines()
             .skip(1)
+            .take(MAX_DEVICES)
             .filter_map(parse_device)
             .collect())
     }
 
     pub async fn connect(&self, endpoint: &str) -> Result<()> {
+        validate_endpoint(endpoint)?;
         // adb server keeps retrying a silent/stale endpoint even after the
         // short-lived `adb connect` client is killed. Probe TCP first so an
         // old wireless-debugging mDNS record cannot accumulate SYN attempts.
@@ -80,6 +95,7 @@ impl Adb {
     }
 
     pub async fn pair(&self, endpoint: &str, code: &str) -> Result<()> {
+        validate_endpoint(endpoint)?;
         if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
             bail!("pairing code must contain exactly six digits");
         }
@@ -104,19 +120,21 @@ impl Adb {
             .context("failed to send pairing code to adb")?;
         drop(stdin);
 
-        let output = tokio::time::timeout(Duration::from_secs(15), child.wait_with_output())
-            .await
-            .context("adb pair timed out")??;
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success()
+        let output =
+            tokio::time::timeout(Duration::from_secs(15), wait_child_output_limited(child))
+                .await
+                .context("adb pair timed out")??;
+        let (status, stdout_bytes, stderr_bytes) = output;
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        if !status.success()
             || stdout.to_ascii_lowercase().contains("failed")
             || stderr.to_ascii_lowercase().contains("failed")
         {
             let message = if stderr.trim().is_empty() {
-                stdout.trim()
+                bounded_diagnostic(&stdout_bytes)
             } else {
-                stderr.trim()
+                bounded_diagnostic(&stderr_bytes)
             };
             bail!("adb pair failed: {}", message.replace(code, "******"));
         }
@@ -155,8 +173,13 @@ impl Adb {
     }
 
     pub async fn screenshot(&self, serial: &str) -> Result<Vec<u8>> {
-        self.output(&["-s", serial, "exec-out", "screencap", "-p"])
-            .await
+        let output = self
+            .output(&["-s", serial, "exec-out", "screencap", "-p"])
+            .await?;
+        if output.len() > 16 * 1024 * 1024 {
+            bail!("ADB screenshot exceeds 16 MiB")
+        }
+        Ok(output)
     }
 
     pub async fn screenshot_to(&self, serial: &str, path: &Path) -> Result<()> {
@@ -164,32 +187,8 @@ impl Adb {
         Ok(())
     }
 
-    /// Remove forwards left by an interrupted ScrcpyForge daemon. The filter is
-    /// deliberately limited to this device and scrcpy localabstract sockets.
-    pub async fn cleanup_scrcpy_forwards(&self, serial: &str) -> Result<usize> {
-        let output = self.output(&["forward", "--list"]).await?;
-        let ports = String::from_utf8_lossy(&output)
-            .lines()
-            .filter_map(|line| {
-                let mut fields = line.split_whitespace();
-                let owner = fields.next()?;
-                let local = fields.next()?;
-                let remote = fields.next()?;
-                (owner == serial
-                    && local.starts_with("tcp:")
-                    && remote.starts_with("localabstract:scrcpy_"))
-                .then(|| local.to_owned())
-            })
-            .collect::<Vec<_>>();
-        for port in &ports {
-            let _ = self
-                .output(&["-s", serial, "forward", "--remove", port])
-                .await;
-        }
-        Ok(ports.len())
-    }
-
     pub async fn input(&self, serial: &str, action: &InputAction) -> Result<()> {
+        action.validate().map_err(anyhow::Error::msg)?;
         let mut owned = vec![
             "-s".to_string(),
             serial.to_string(),
@@ -220,12 +219,168 @@ impl Adb {
     }
 }
 
+async fn wait_child_output_limited(
+    mut child: Child,
+) -> Result<(std::process::ExitStatus, Vec<u8>, Vec<u8>)> {
+    let stdout = child.stdout.take().context("failed to open adb stdout")?;
+    let stderr = child.stderr.take().context("failed to open adb stderr")?;
+    let budget = Arc::new(AtomicUsize::new(0));
+    let mut stdout_reader = Box::pin(read_output_limited(stdout, budget.clone()));
+    let mut stderr_reader = Box::pin(read_output_limited(stderr, budget));
+    let mut wait = Box::pin(child.wait());
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+    let mut status = None;
+    let mut stdout_result = None;
+    let mut stderr_result = None;
+    while status.is_none() || !stdout_done || !stderr_done {
+        tokio::select! {
+            result = &mut stdout_reader, if !stdout_done => {
+                stdout_done = true;
+                stdout_result = Some(result);
+                if stdout_result.as_ref().is_some_and(|result| result.is_err()) {
+                    break;
+                }
+            }
+            result = &mut stderr_reader, if !stderr_done => {
+                stderr_done = true;
+                stderr_result = Some(result);
+                if stderr_result.as_ref().is_some_and(|result| result.is_err()) {
+                    break;
+                }
+            }
+            result = &mut wait, if status.is_none() => {
+                status = Some(result.context("failed to wait for adb")?);
+            }
+        }
+    }
+    if stdout_result.as_ref().is_some_and(|result| result.is_err())
+        || stderr_result.as_ref().is_some_and(|result| result.is_err())
+    {
+        drop(stdout_reader);
+        drop(stderr_reader);
+        drop(wait);
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        return Err(match stdout_result {
+            Some(Err(error)) => error,
+            _ => match stderr_result {
+                Some(Err(error)) => error,
+                _ => anyhow::anyhow!("failed to read adb output"),
+            },
+        });
+    }
+    let stdout = stdout_result.context("adb stdout reader did not finish")??;
+    let stderr = stderr_result.context("adb stderr reader did not finish")??;
+    Ok((
+        status.context("adb exited without a status")?,
+        stdout,
+        stderr,
+    ))
+}
+
+async fn read_output_limited<R: AsyncRead + Unpin>(
+    mut reader: R,
+    budget: Arc<AtomicUsize>,
+) -> Result<Vec<u8>> {
+    let mut output = Vec::new();
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = reader.read(&mut buffer).await?;
+        if count == 0 {
+            break;
+        }
+        let mut used = budget.load(Ordering::Acquire);
+        loop {
+            let next = used
+                .checked_add(count)
+                .context("adb output size overflow")?;
+            if next > MAX_ADB_OUTPUT_BYTES {
+                bail!(
+                    "adb output exceeds {} MiB",
+                    MAX_ADB_OUTPUT_BYTES / (1024 * 1024)
+                );
+            }
+            match budget.compare_exchange_weak(used, next, Ordering::AcqRel, Ordering::Acquire) {
+                Ok(_) => break,
+                Err(current) => used = current,
+            }
+        }
+        output.extend_from_slice(&buffer[..count]);
+    }
+    Ok(output)
+}
+
+fn bounded_diagnostic(bytes: &[u8]) -> String {
+    let truncated = bytes.len() > MAX_ADB_ERROR_BYTES;
+    let mut message = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_ADB_ERROR_BYTES)])
+        .trim()
+        .to_owned();
+    if truncated {
+        message.push('…');
+    }
+    message
+}
+
+/// Validate a host:port endpoint before any network or ADB subprocess work.
+/// The daemon uses this as its request-level validation so malformed input is
+/// reported as a client error instead of an opaque subprocess failure.
+pub fn validate_endpoint(endpoint: &str) -> Result<()> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty()
+        || endpoint.len() > 255
+        || endpoint
+            .chars()
+            .any(|ch| ch.is_control() || ch.is_whitespace())
+        || endpoint.contains('/')
+    {
+        bail!("invalid network endpoint")
+    }
+    if let Ok(address) = endpoint.parse::<std::net::SocketAddr>() {
+        if address.port() != 0 {
+            return Ok(());
+        }
+    }
+    let (host, port) = if let Some(rest) = endpoint.strip_prefix('[') {
+        let (host, port) = rest
+            .split_once(']')
+            .and_then(|(host, suffix)| suffix.strip_prefix(':').map(|port| (host, port)))
+            .context("invalid bracketed endpoint")?;
+        (host, port)
+    } else {
+        endpoint
+            .rsplit_once(':')
+            .context("endpoint must include a port")?
+    };
+    let ipv6_host = host
+        .split_once('%')
+        .map(|(address, _)| address)
+        .unwrap_or(host)
+        .parse::<std::net::Ipv6Addr>()
+        .is_ok();
+    if host.is_empty()
+        || !port.parse::<u16>().ok().is_some_and(|value| value != 0)
+        || (host.contains(':') && !ipv6_host)
+        || host
+            .bytes()
+            .any(|byte| !(byte.is_ascii_alphanumeric() || b".-_:%".contains(&byte)))
+    {
+        bail!("invalid network endpoint")
+    }
+    Ok(())
+}
+
 fn discover_adb_mdns(service_type: &str) -> Result<Vec<PairingService>> {
     use mdns_sd::{ServiceDaemon, ServiceEvent};
     let daemon = ServiceDaemon::new()?;
     let service_fullname = format!("{service_type}.local.");
     let receiver = daemon.browse(&service_fullname)?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let timeout_ms = std::env::var("SCRCPYFORGE_MDNS_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(2_000)
+        .clamp(500, 4_000);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
     let mut services = Vec::new();
     while std::time::Instant::now() < deadline {
         match receiver.recv_timeout(std::time::Duration::from_millis(200)) {
@@ -252,10 +407,14 @@ fn discover_adb_mdns(service_type: &str) -> Result<Vec<PairingService>> {
                             .to_owned();
                         services.push(PairingService { name, endpoint })
                     }
+                    if services.len() >= MAX_MDNS_SERVICES {
+                        break;
+                    }
                 }
             }
             Ok(_) => {}
-            Err(_) => {}
+            Err(flume::RecvTimeoutError::Timeout) => {}
+            Err(flume::RecvTimeoutError::Disconnected) => break,
         }
     }
     let _ = daemon.stop_browse(&service_fullname);
@@ -287,6 +446,9 @@ fn parse_mdns_services(bytes: &[u8], service_type: &str) -> Vec<PairingService> 
                 name: (*name).to_owned(),
                 endpoint: (*endpoint).to_owned(),
             });
+            if services.len() >= MAX_MDNS_SERVICES {
+                break;
+            }
         }
     }
     services
@@ -357,6 +519,28 @@ adb-connect _adb-tls-connect._tcp 192.168.1.2:39555\n";
         let output = b"one _adb-tls-connect._tcp [fe80::1]:4000\n\
 two _adb-tls-connect._tcp [fe80::1]:4000\n";
         assert_eq!(parse_mdns_services(output, CONNECT_SERVICE).len(), 1);
+    }
+
+    #[test]
+    fn validates_network_endpoints_without_accepting_ambiguous_hosts() {
+        for endpoint in [
+            "192.168.1.2:5555",
+            "[fe80::1]:5555",
+            "fe80::1:5555",
+            "phone.local:5555",
+        ] {
+            assert!(validate_endpoint(endpoint).is_ok(), "{endpoint}");
+        }
+        for endpoint in [
+            "",
+            "phone.local",
+            "phone:bad",
+            "a:b:5555",
+            "host:0",
+            "host/5555",
+        ] {
+            assert!(validate_endpoint(endpoint).is_err(), "{endpoint}");
+        }
     }
 
     #[tokio::test]

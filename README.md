@@ -12,7 +12,9 @@ clients use one versioned local REST/WebSocket API.
 - USB and wireless-ADB discovery, including pairing-code setup and
   paired-device mDNS discovery.
 - H.264, H.265, and AV1 scrcpy video sessions with latest-frame delivery.
-- Desktop, browser, CLI, and headless API workflows.
+- Connected devices start sessions automatically; new sessions default to
+  five-second preview mode.
+- Desktop, template-capture browser page, CLI, and headless API workflows.
 - Per-device Lua automation with native template matching and input control.
 - Independent script and preview performance profiles.
 - Real-time JPEG WebSocket preview, five-second preview, or preview disabled.
@@ -48,20 +50,26 @@ cargo run -p forge-cli -- devices
 cargo run -p forge-desktop
 ```
 
-The daemon listens on `127.0.0.1:27180` by default. Its built-in browser UI is
-available at `http://127.0.0.1:27180/`.
+The daemon listens on `0.0.0.0:27180` by default so the built-in template
+capture page can be opened from another device on the same LAN. Open
+`http://<host-lan-ip>:27180/` in that device's browser. Set `SCRCPYFORGE_ADDR`
+to restrict the listener to a specific address. The bundled browser page is
+limited to template acquisition; use the desktop client, CLI, or API for other
+device and script controls.
 
 ## Typical workflow
 
-1. Start the daemon and scan for devices.
-2. For an unpaired device, choose **Wireless pairing** in the browser or
-   desktop client and enter Android's six-digit pairing code.
-3. Start a scrcpy session for a selected device.
-4. Choose preview and performance profiles as needed.
+1. Start the daemon; it scans for connected devices automatically.
+2. For an unpaired device, choose **Wireless pairing** in the desktop client
+   or use the API and enter Android's six-digit pairing code.
+3. The daemon automatically starts a scrcpy session for every connected device.
+4. Preview defaults to one frame every five seconds; choose another preview or
+   performance profile only when needed.
 5. Run a named Lua script or submit Lua source through the API.
 6. Observe script logs and lifecycle events over `/api/v1/events`.
 
-Example session start:
+The explicit session start endpoint remains available for retries or clients
+that want to override capture options:
 
 ```sh
 curl -X POST http://127.0.0.1:27180/api/v1/sessions/DEVICE_SERIAL/start \
@@ -88,7 +96,7 @@ coexist without terminating active device sessions.
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `SCRCPYFORGE_ADDR` | `127.0.0.1:27180` | Daemon listen address; also used by the CLI. |
+| `SCRCPYFORGE_ADDR` | `0.0.0.0:27180` | Daemon listen address; also used by the CLI. |
 | `SCRCPYFORGE_API` | `http://127.0.0.1:27180/api/v1` | Desktop launch helper API URL. |
 | `SCRCPYFORGE_ADB` | `adb` | ADB executable path or command name. |
 | `SCRCPYFORGE_SERVER_JAR` | auto-discovered | scrcpy server v4.0 artifact. |
@@ -96,9 +104,11 @@ coexist without terminating active device sessions.
 | `SCRCPYFORGE_SCRIPTS_DIR` | `<data>/scripts` | Named Lua script packages. |
 | `SCRCPYFORGE_TEMPLATES_DIR` | `<data>/templates` | Saved image regions/templates. |
 | `SCRCPYFORGE_ADB_TIMEOUT_MS` | `15000` | Timeout for one ADB subprocess command. |
+| `SCRCPYFORGE_MDNS_TIMEOUT_MS` | `2000` | One mDNS discovery wait, clamped to 500–4000 ms. |
 | `SCRCPYFORGE_CV_THREADS` | host-dependent, max `4` by default | OpenCV matching thread budget. |
 | `SCRCPYFORGE_DECODE_THREADS` | host parallelism capped at `2` | FFmpeg decoder thread count per session. |
 | `SCRCPYFORGE_DECODE_THREAD_TYPE` | `slice` | FFmpeg threading mode (`slice`, `frame`, or `none`). |
+| `SCRCPYFORGE_AUTH_TOKEN` | unset | Optional; when set, protects all non-public API routes with a Bearer token (at least 16 bytes). |
 | `SCRCPYFORGE_FONT` | platform CJK font discovery | Optional UI font file. |
 | `RUST_LOG` | daemon info logs | Standard tracing filter. |
 
@@ -115,11 +125,16 @@ decoding; RGB and JPEG are generated lazily only when vision or preview needs
 them. Static screens do not wake the frame callback unless a script explicitly
 sets a rescan interval.
 
-Declarative vision scripts keep an independent position track for each target:
-they search near the last stable center, expand the ROI after a miss, and fall
-back to a full scan for recovery. A script may opt into periodic checks of a
-static latest frame without building a historical frame queue; cooldown and
-rearm rules prevent repeated actions from a single visible instance.
+Declarative vision scripts scan the full frame on every callback until a target
+has three nearby-position hits. They then save a ROI sized at twice the
+template width and three times its height in
+.scrcpyforge-vision-roi.state beside the named script and use only that ROI.
+Each named script directory has its own state file, so moving the script
+directory moves its learned ROI with it. Misses never expand the ROI or fall
+back to a full scan; delete the state file to relearn. Cooldown is disabled by default; when configured, only a
+successful action starts it.
+A script may opt into periodic checks of a
+static latest frame without building a historical frame queue.
 
 Script profiles (`auto`, `eco`, `balanced`, `realtime`) and preview profiles are
 configured independently. Performance depends on the host, encoder, transport,
@@ -135,10 +150,14 @@ compile time or runtime.
 
 ## Security
 
-The API currently has no authentication and uses permissive CORS. Keep the
-default loopback bind unless the surrounding network and access controls are
-trusted. Lua scripts can control connected devices and should be treated as
-trusted local code.
+The default API listens on all interfaces for LAN template acquisition. Without
+a token, browser requests carrying an unrelated `Origin` are rejected, but
+direct clients on the LAN can still reach the API. Set a random
+`SCRCPYFORGE_AUTH_TOKEN` of at least 16 bytes to require
+`Authorization: Bearer <token>` on every non-public route. Lua runs with a
+restricted standard library without `io`, `os`, `package`, or dynamic module
+loading. Scripts can still control connected devices and should be managed as
+privileged automation code.
 
 ## License
 

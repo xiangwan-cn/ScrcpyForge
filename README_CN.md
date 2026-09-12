@@ -10,7 +10,8 @@ Android 自动化运行时。无界面后端统一持有设备及媒体/控制�
 
 - 发现 USB 和无线 ADB 设备，包括配对码无线配对和通过 mDNS 连接已配对设备。
 - 使用 H.264、H.265 或 AV1 建立 scrcpy 视频会话，并始终提供最新画面。
-- 支持桌面端、浏览器、命令行和纯 API 使用方式。
+- 设备连接后自动启动会话，新会话默认使用五秒一图预览。
+- 支持桌面端、模板获取浏览器页面、命令行和纯 API 使用方式。
 - 为每台设备独立运行 Lua 自动化，提供原生模板匹配和输入控制。
 - 脚本性能档位与预览性能档位相互独立。
 - 支持实时 JPEG WebSocket 预览、每五秒一帧或关闭预览。
@@ -45,20 +46,22 @@ cargo run -p forge-cli -- devices
 cargo run -p forge-desktop
 ```
 
-后端默认监听 `127.0.0.1:27180`，内置浏览器界面位于
-`http://127.0.0.1:27180/`。
+后端默认监听 `0.0.0.0:27180`，内置模板获取页面可从同一局域网的其他设备访问。
+在浏览器打开 `http://<后端设备局域网IP>:27180/`；也可以通过
+`SCRCPYFORGE_ADDR` 限制监听地址。内置浏览器页面只保留模板获取功能，其他设备和脚本
+控制请使用桌面端、命令行或 API。
 
 ## 典型流程
 
-1. 启动后端并扫描设备。
-2. 如设备尚未配对，在浏览器或桌面端选择“无线配对”，输入 Android 显示的六位
+1. 启动后端；后端会自动扫描已连接设备。
+2. 如设备尚未配对，在桌面端选择“无线配对”，或通过 API 输入 Android 显示的六位
    配对码。
-3. 为选定设备启动 scrcpy 会话。
-4. 按需选择预览模式和性能档位。
+3. 后端会为每个已连接设备自动启动 scrcpy 会话。
+4. 预览默认每五秒一帧；只有需要时再选择其他预览模式和性能档位。
 5. 运行命名 Lua 脚本，或通过 API 直接提交 Lua 源码。
 6. 通过 `/api/v1/events` 接收脚本日志和生命周期事件。
 
-启动会话示例：
+如需重试或覆盖采集参数，仍可显式调用启动会话端点：
 
 ```sh
 curl -X POST http://127.0.0.1:27180/api/v1/sessions/DEVICE_SERIAL/start \
@@ -83,7 +86,7 @@ curl -X POST http://127.0.0.1:27180/api/v1/sessions/DEVICE_SERIAL/start \
 
 | 环境变量 | 默认值 | 用途 |
 | --- | --- | --- |
-| `SCRCPYFORGE_ADDR` | `127.0.0.1:27180` | 后端监听地址，命令行也使用该地址。 |
+| `SCRCPYFORGE_ADDR` | `0.0.0.0:27180` | 后端监听地址，命令行也使用该地址。 |
 | `SCRCPYFORGE_API` | `http://127.0.0.1:27180/api/v1` | 桌面启动辅助脚本使用的 API 地址。 |
 | `SCRCPYFORGE_ADB` | `adb` | ADB 可执行文件路径或命令名。 |
 | `SCRCPYFORGE_SERVER_JAR` | 自动发现 | scrcpy server v4.0 文件。 |
@@ -91,9 +94,11 @@ curl -X POST http://127.0.0.1:27180/api/v1/sessions/DEVICE_SERIAL/start \
 | `SCRCPYFORGE_SCRIPTS_DIR` | `<数据目录>/scripts` | 命名 Lua 脚本包目录。 |
 | `SCRCPYFORGE_TEMPLATES_DIR` | `<数据目录>/templates` | 保存的截图区域/模板目录。 |
 | `SCRCPYFORGE_ADB_TIMEOUT_MS` | `15000` | 单次 ADB 子进程命令超时（毫秒）。 |
+| `SCRCPYFORGE_MDNS_TIMEOUT_MS` | `2000` | 单次 mDNS 发现等待时间，限制在 500–4000 毫秒。 |
 | `SCRCPYFORGE_CV_THREADS` | 依主机而定，默认最多 `4` | OpenCV 模板匹配线程预算。 |
 | `SCRCPYFORGE_DECODE_THREADS` | 主机并行度，最多 `2` | 每个会话的 FFmpeg 解码线程数。 |
 | `SCRCPYFORGE_DECODE_THREAD_TYPE` | `slice` | FFmpeg 线程模式：`slice`、`frame` 或 `none`。 |
+| `SCRCPYFORGE_AUTH_TOKEN` | 未设置 | 可选；设置后所有非公开 API 需要 Bearer token（至少 16 字节）。 |
 | `SCRCPYFORGE_FONT` | 自动查找平台中文字体 | 可选的界面字体文件。 |
 | `RUST_LOG` | 后端 info 日志 | 标准 tracing 日志过滤器。 |
 
@@ -108,9 +113,11 @@ curl -X POST http://127.0.0.1:27180/api/v1/sessions/DEVICE_SERIAL/start \
 或预览需要时延迟生成 RGB/JPEG。静止画面默认不会唤醒帧回调；脚本显式设置
 `rescan_interval_ms` 后才会按配置重检。
 
-声明式视觉脚本为每个目标独立记忆位置：先在上次稳定中心附近匹配，局部失败后扩大
-ROI，继续失败则回退全屏。脚本可选择用最新帧低频重检静止画面，不建立历史帧队列；
-冷却和消失重触发规则避免同一个持续可见目标重复点击。
+声明式视觉脚本默认每帧全屏匹配；目标在相近位置连续命中三次后，记录模板宽度 2 倍、
+高度 3 倍的 ROI，并写入脚本目录的 .scrcpyforge-vision-roi.state。之后只在该 ROI
+匹配。每个命名脚本目录独立保存该文件，移动脚本目录时位置记忆也会随之移动；不会因
+miss 自动扩大或回退全屏，删除状态文件即可重新学习位置。冷却默认关闭，只有显式配置
+正数且动作成功才进入冷却等待。脚本可选择用最新帧低频重检静止画面，不建立历史帧队列。
 
 脚本档位（`auto`、`eco`、`balanced`、`realtime`）和预览档位分别配置。性能取决于
 主机、设备编码器、传输方式、画面尺寸、模板和场景；编译或运行时均不会选择针对
@@ -125,8 +132,11 @@ ROI，继续失败则回退全屏。脚本可选择用最新帧低频重检静�
 
 ## 安全说明
 
-当前 API 不提供身份验证，并启用了宽松 CORS。除非所在网络和访问控制可信，否则
-应保持默认的回环地址监听。Lua 脚本可以控制连接的设备，应将其视为可信本地代码。
+默认 API 监听所有网卡，用于局域网模板获取。未设置 token 时，带有不匹配
+`Origin` 的浏览器请求会被拒绝，但局域网内的直接客户端仍可访问 API。设置至少
+16 字节的随机 `SCRCPYFORGE_AUTH_TOKEN` 后，所有非公开路由都必须通过
+`Authorization: Bearer <token>` 认证。Lua 使用受限标准库，不能访问 `io`、`os`、
+`package` 或动态加载模块；脚本仍可控制已连接设备，应按高权限自动化代码管理。
 
 ## 许可证
 

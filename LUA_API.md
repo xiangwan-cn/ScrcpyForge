@@ -30,8 +30,7 @@ Linux、Windows、macOS 间直接迁移。`forge.script_dir` 提供当前脚本�
 forge.vision {
     threshold = 0.85,                 -- 默认匹配阈值
     roi = {0, 0, 1280, 720},          -- 可省略，格式为 x1,y1,x2,y2
-    interval_ms = 30,                 -- 未命中后的识别间隔
-    after_match_ms = 500,             -- 任一目标命中后的全局间隔
+    action_delay_ms = 500,            -- 命中后等待 500ms 再执行动作
     action = {type = "tap", radius = 4},
     targets = {                       -- 顺序就是匹配优先级
         {name = "确认", template = forge.asset("confirm.png")},
@@ -43,7 +42,8 @@ forge.vision {
 }
 ```
 
-目标可覆盖 `threshold`、`roi`、`multiscale`、`cooldown_ms`、`action`，也可设置
+单个脚本最多注册 16 个声明式视觉 engine，每个 engine 最多 64 个目标。目标可覆盖
+`threshold`、`roi`、`multiscale`、`cooldown_ms`、`action`，也可设置
 `enabled = bool/function` 和 `on_match(match, frame, target)`。目标 `on_match` 会替代
 默认动作；顶层 `on_match(target, match, frame)` 是动作完成后的统一通知。
 
@@ -55,21 +55,30 @@ forge.vision {
 - `"none"` 或 Lua 函数
 
 当所有可用目标使用相同阈值、ROI 和单尺度模式时，调度器自动调用一次
-`frame:find_candidates()`，共享帧颜色转换并为每个模板保留最佳候选。冷却或未重新武装时
-只按 `observe_interval_ms` 低频观察，正常状态才逐帧更新轨迹；目标覆盖不同参数、动态禁用
-或启用多尺度时会按对应策略单独匹配。
+`frame:find_candidates()`，共享帧颜色转换并为每个模板保留最佳候选。
 
-调度器为每个目标独立记录最近中心、稳定历史、局部 ROI 和 miss 次数。锁定后优先搜索
-上次命中附近，局部失败会扩大 ROI，持续失败或周期校正时回到全屏。`tracking = false`
-可以关闭位置记忆并保留全屏路径。目标默认 `rearm = "disappear"`，点击后需连续若干次
-未命中才允许同一实例再次点击；需要固定周期点击且目标持续存在时可改为
-`rearm = "timer"`。设置 `rescan_interval_ms` 后，声明式引擎才会在没有新视频帧时
-低频重检同一最新帧（非零值限制在 50–60000ms）；默认路径等待新帧或取消信号。
+默认每个视频回调都走全屏 `scan_global`，不会因为 frame sequence 重复或画面签名相同而
+跳过匹配。目标连续三次命中且中心距离不超过 `tracking.position_tolerance_px` 后，
+以三次中心的平均位置建立 ROI：宽度为模板宽度的 2 倍，高度为模板高度的 3 倍。
+该 ROI 写入命名脚本目录的 `.scrcpyforge-vision-roi.state`，下次运行且屏幕尺寸一致时直接
+复用；每个命名脚本目录独立保存该文件，移动脚本目录时位置记忆也会随之移动。复用后只走
+`scan_persistent_roi`，不会在 miss 时自动扩大或回退全屏。删除该文件即可重新学习位置。
+`tracking = false` 可关闭位置记忆并始终使用全屏路径。
+
+`action_delay_ms`（或目标同名配置）只延迟动作执行，延迟期间仍会继续匹配并更新中心。
+`cooldown_ms` 默认为 0（不等待）；配置为正数时，只有动作成功后才开始该等待，
+等待期间不匹配；动作失败或没有动作不会启动等待。
+目标默认 `rearm = "disappear"`，等待结束后需连续若干次未命中才允许同一实例再次点击；
+需要固定周期点击且目标持续存在时可改为 `rearm = "timer"`。设置 `rescan_interval_ms`
+后，声明式引擎会在没有新视频帧时低频重检同一最新帧（非零值限制在 50–60000ms）。
 
 `forge.vision()` 返回 engine，可手动调用 `engine:process(frame)`，或读取
 `engine:stats()` 的 `scans`、`matches`、`below_threshold`、
-`duplicate_frames_skipped`、`scene_gate_skipped`、`full_backoff_skipped`、
-`observation_backoff_skipped` 和逐目标 `scan_mode`、`last_decision`、`last_score` 状态。
+`global_scans`、`roi_scans`、`roi_locks`、`roi_misses`、`persisted_loads`、
+`persisted_saves` 和逐目标 `persistent_roi`、`scan_mode`、`last_decision`、
+`last_score`、`pending_action_at`、`wait_until_ms` 状态。保留的
+`duplicate_frames_skipped`、`scene_gate_skipped` 和各类 backoff 计数在当前策略中为零，
+用于兼容旧客户端。
 注册后默认自动生成 `on_frame`；脚本随后定义
 自己的 `on_frame` 即可接管调度，底层能力不会被限制。
 
@@ -96,24 +105,25 @@ forge.vision {
 
 ## 设备与输入 API
 
-- `forge.tap(x, y [, radius_px])`：精确点击或圆形半径内随机点击
+- `forge.tap(x, y [, radius_px])`：精确点击或圆形半径内随机点击，半径最多 4096px
 - `forge.swipe(...)`、`forge.long_press(...)`、`forge.multi_tap(...)`
 - `forge.press_key(...)`、`forge.press_back()`、`forge.input_text(text)`
 - `forge.screen_size()`、`forge.wait(ms)`
 - `forge.serial()`、`forge.device_name`、`forge.monotonic_ms()`、`forge.log(text)`
 - `forge.performance_profile()`：`auto/eco/balanced/realtime`
-- `forge.recommended_interval_ms()`：当前性能档位建议的未命中扫描间隔
+- `forge.recommended_interval_ms()`：当前性能档位建议值（仅用于调度统计）
 - `forge.KEY_BACK`、`KEY_HOME`、`KEY_ENTER` 等 Android 键值常量
 
-输入优先使用当前 scrcpy 控制通道，不为每次动作创建 ADB 子进程。脚本文件每次启动
+输入优先使用当前 scrcpy 控制通道，不为每次动作创建 ADB 子进程。单次滑动/长按最多
+持续 60 秒，文本最多 4 KiB，多指最多 10 个指针；超限会在动作发送前失败。脚本文件每次启动
 时重新读取，修改后无需重启后端；可用 `SCRCPYFORGE_SCRIPTS_DIR` 更改脚本根目录。
 
-声明式脚本未指定 `interval_ms` 时会自动采用性能档位建议值；明确填写后以脚本配置
-为准。基准测试脚本直接使用底层 API，不受档位节流影响。
+声明式视觉匹配按每个回调执行；`interval_ms` 和性能档位建议值不再把重复帧或相似帧
+过滤掉。基准测试脚本直接使用底层 API，不受档位节流影响。
 
 脚本性能与预览性能彼此独立。`script-profile` 只影响上述 Lua 建议间隔，
 `preview-profile` 只影响 JPEG/WebSocket 刷新率；关闭或降低预览不会降低解码帧率，
 脚本仍然接收最新解码帧。
 
-声明式视觉配置可选 `scene_gate = true` 跳过相同亮度场景，也可设置
-`rescan_interval_ms` 对静止画面按需重检；相同 `frame_seq` 不会重复执行模板匹配。
+声明式视觉不会使用 `scene_gate` 或相同 `frame_seq` 跳过模板匹配；设置
+`rescan_interval_ms` 后仍可对没有新视频帧的静止画面按需重检。

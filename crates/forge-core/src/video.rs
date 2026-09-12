@@ -11,6 +11,8 @@ use ffmpeg_next as ffmpeg;
 
 use crate::protocol::stream::Codec;
 
+const MAX_VIDEO_DIMENSION: u32 = 8192;
+
 extern "C" {
     fn forge_i420_to_rgb(yuv: *const u8, width: i32, height: i32, rgb: *mut u8) -> i32;
     fn forge_i420_roi_to_rgb(
@@ -38,7 +40,7 @@ pub struct VideoFrame {
     pub frame_seq: u64,
     yuv: Vec<u8>,
     decoded_at: Instant,
-    rgb: OnceLock<Vec<u8>>,
+    rgb: OnceLock<std::result::Result<Vec<u8>, String>>,
     jpeg: OnceLock<std::result::Result<bytes::Bytes, String>>,
 }
 
@@ -73,6 +75,8 @@ impl VideoFrame {
             || !self.height.is_multiple_of(2)
             || self.width > i32::MAX as u32
             || self.height > i32::MAX as u32
+            || self.width > MAX_VIDEO_DIMENSION
+            || self.height > MAX_VIDEO_DIMENSION
         {
             bail!("I420 frame dimensions must be non-zero and even")
         }
@@ -99,24 +103,52 @@ impl VideoFrame {
     /// or `luma_signature`) before trusting malformed input.
     pub fn y_plane(&self) -> &[u8] {
         let size = (self.width as usize).saturating_mul(self.height as usize);
-        &self.yuv[..size]
+        &self.yuv[..size.min(self.yuv.len())]
     }
     pub(crate) fn y_plane_checked(&self) -> Result<&[u8]> {
         let size = self.validate_i420()?;
         Ok(&self.yuv[..size])
     }
     /// Return a cheap, deterministic fingerprint of the luma plane. It is used
-    /// as an optional scene-change gate; this samples at most 64 quantized
-    /// points and is deliberately much cheaper than converting the frame to
-    /// RGB. Quantization absorbs small codec fluctuations on static screens.
+    /// as an optional scene-change gate; a small mean/variance sample in each
+    /// tile catches local UI changes while remaining far cheaper than
+    /// converting the frame to RGB. Quantization absorbs small codec
+    /// fluctuations on static screens.
     pub fn luma_signature(&self) -> Result<u64> {
         let y = self.y_plane_checked()?;
         let mut hash = 0xcbf29ce484222325u64;
-        let samples = 64usize.min(y.len().max(1));
-        for index in 0..samples {
-            let offset = index.saturating_mul(y.len().saturating_sub(1)) / samples.max(1);
-            hash ^= (y[offset] as u64) >> 3;
-            hash = hash.wrapping_mul(0x100000001b3);
+        const TILES_X: u32 = 16;
+        const TILES_Y: u32 = 9;
+        for tile_y in 0..TILES_Y {
+            for tile_x in 0..TILES_X {
+                let x0 = tile_x * self.width / TILES_X;
+                let x1 = ((tile_x + 1) * self.width / TILES_X)
+                    .max(x0 + 1)
+                    .min(self.width);
+                let y0 = tile_y * self.height / TILES_Y;
+                let y1 = ((tile_y + 1) * self.height / TILES_Y)
+                    .max(y0 + 1)
+                    .min(self.height);
+                let mut sum = 0u64;
+                let mut square_sum = 0u64;
+                for sample_y in 0..2 {
+                    let y_pos = (y0 + ((y1 - y0) * (sample_y + 1) / 3)).min(y1 - 1);
+                    for sample_x in 0..2 {
+                        let x_pos = (x0 + ((x1 - x0) * (sample_x + 1) / 3)).min(x1 - 1);
+                        let value = y[y_pos as usize * self.width as usize + x_pos as usize] as u64;
+                        sum += value;
+                        square_sum += value * value;
+                    }
+                }
+                // Four samples per tile. The numerator avoids floating point
+                // drift and is small enough to stay within u64 at any
+                // supported frame size.
+                let variance_numerator = square_sum * 4 - sum * sum;
+                hash ^= (sum / 4) >> 3;
+                hash = hash.wrapping_mul(0x100000001b3);
+                hash ^= (variance_numerator / 16) >> 3;
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
         }
         hash ^= self.width as u64;
         hash = hash.wrapping_mul(0x100000001b3);
@@ -147,28 +179,33 @@ impl VideoFrame {
         ))
     }
     pub fn rgb(&self) -> Result<&[u8]> {
-        if let Some(value) = self.rgb.get() {
-            return Ok(value);
+        let value = self.rgb.get_or_init(|| {
+            let result = (|| -> Result<Vec<u8>> {
+                self.validate_i420()?;
+                let rgb_len = (self.width as usize)
+                    .checked_mul(self.height as usize)
+                    .and_then(|size| size.checked_mul(3))
+                    .context("RGB frame dimensions overflow")?;
+                let mut value = vec![0u8; rgb_len];
+                let code = unsafe {
+                    forge_i420_to_rgb(
+                        self.yuv.as_ptr(),
+                        self.width as i32,
+                        self.height as i32,
+                        value.as_mut_ptr(),
+                    )
+                };
+                if code != 0 {
+                    bail!("I420 to RGB conversion failed with code {code}")
+                }
+                Ok(value)
+            })();
+            result.map_err(|error| error.to_string())
+        });
+        match value {
+            Ok(rgb) => Ok(rgb),
+            Err(error) => bail!("I420 to RGB conversion failed: {error}"),
         }
-        self.validate_i420()?;
-        let rgb_len = (self.width as usize)
-            .checked_mul(self.height as usize)
-            .and_then(|size| size.checked_mul(3))
-            .context("RGB frame dimensions overflow")?;
-        let mut value = vec![0u8; rgb_len];
-        let code = unsafe {
-            forge_i420_to_rgb(
-                self.yuv.as_ptr(),
-                self.width as i32,
-                self.height as i32,
-                value.as_mut_ptr(),
-            )
-        };
-        if code != 0 {
-            bail!("I420 to RGB conversion failed with code {code}")
-        }
-        let _ = self.rgb.set(value);
-        Ok(self.rgb.get().expect("RGB cache initialized"))
     }
     /// Convert only an even-aligned ROI. I420 chroma is sampled for each 2x2
     /// luma block, so the requested rectangle is expanded by at most one pixel
@@ -240,6 +277,15 @@ unsafe impl Send for FfmpegDecoder {}
 
 impl FfmpegDecoder {
     pub fn new(codec_kind: Codec, width: u32, height: u32) -> Result<Self> {
+        if width == 0
+            || height == 0
+            || !width.is_multiple_of(2)
+            || !height.is_multiple_of(2)
+            || width > MAX_VIDEO_DIMENSION
+            || height > MAX_VIDEO_DIMENSION
+        {
+            bail!("decoder dimensions are outside the supported range")
+        }
         ffmpeg::init()?;
         let id = match codec_kind {
             Codec::H264 => codec::Id::H264,
@@ -278,14 +324,48 @@ impl FfmpegDecoder {
     pub fn decode(&mut self, data: &[u8], pts_us: i64) -> Result<Vec<VideoFrame>> {
         let mut packet = ffmpeg::Packet::copy(data);
         packet.set_pts(Some(pts_us));
-        self.decoder.send_packet(&packet)?;
-        self.receive()
+        let mut frames = Vec::new();
+        for _ in 0..2 {
+            match self.decoder.send_packet(&packet) {
+                Ok(()) => {
+                    frames.extend(self.receive()?);
+                    return Ok(frames);
+                }
+                Err(ffmpeg::Error::Other { errno }) if errno == ffmpeg::error::EAGAIN => {
+                    // A decoder may ask the caller to drain output before it
+                    // accepts the next packet. EAGAIN is normal flow control;
+                    // only a second refusal after draining is a real error.
+                    frames.extend(self.receive()?);
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("decoder input remained back-pressured after draining")
     }
     fn receive(&mut self) -> Result<Vec<VideoFrame>> {
         let mut frames = Vec::new();
         let mut decoded = frame::Video::empty();
-        while self.decoder.receive_frame(&mut decoded).is_ok() {
+        loop {
+            if let Err(error) = self.decoder.receive_frame(&mut decoded) {
+                if matches!(error, ffmpeg::Error::Eof)
+                    || matches!(error, ffmpeg::Error::Other { errno } if errno == ffmpeg::error::EAGAIN)
+                {
+                    break;
+                }
+                return Err(error.into());
+            }
             let size = (decoded.width(), decoded.height());
+            if size.0 == 0
+                || size.1 == 0
+                || !size.0.is_multiple_of(2)
+                || !size.1.is_multiple_of(2)
+                || size.0 > i32::MAX as u32
+                || size.1 > i32::MAX as u32
+                || size.0 > MAX_VIDEO_DIMENSION
+                || size.1 > MAX_VIDEO_DIMENSION
+            {
+                bail!("decoder returned invalid YUV420 dimensions")
+            }
             let normalized = if decoded.format() != Pixel::YUV420P {
                 if self.scaler.is_none() || self.output_size != size {
                     self.scaler = Some(Scaler::get(
@@ -320,9 +400,9 @@ impl FfmpegDecoder {
                     .checked_add(chroma_size)
                     .context("decoded frame dimensions overflow")?,
             );
-            copy_plane(source, 0, size.0, size.1, &mut packed);
-            copy_plane(source, 1, cw, ch, &mut packed);
-            copy_plane(source, 2, cw, ch, &mut packed);
+            copy_plane(source, 0, size.0, size.1, &mut packed)?;
+            copy_plane(source, 1, cw, ch, &mut packed)?;
+            copy_plane(source, 2, cw, ch, &mut packed)?;
             frames.push(VideoFrame::new_i420(
                 size.0,
                 size.1,
@@ -333,13 +413,31 @@ impl FfmpegDecoder {
         Ok(frames)
     }
 }
-fn copy_plane(frame: &frame::Video, index: usize, width: u32, height: u32, output: &mut Vec<u8>) {
+fn copy_plane(
+    frame: &frame::Video,
+    index: usize,
+    width: u32,
+    height: u32,
+    output: &mut Vec<u8>,
+) -> Result<()> {
     let stride = frame.stride(index);
     let data = frame.data(index);
+    if stride < width as usize {
+        bail!("decoder plane stride is smaller than its width")
+    }
+    let required = height
+        .checked_sub(1)
+        .and_then(|rows| (rows as usize).checked_mul(stride))
+        .and_then(|start| start.checked_add(width as usize))
+        .context("decoder plane dimensions overflow")?;
+    if data.len() < required {
+        bail!("decoder plane buffer is shorter than its stride")
+    }
     for row in 0..height as usize {
         let start = row * stride;
         output.extend_from_slice(&data[start..start + width as usize]);
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -361,5 +459,22 @@ mod tests {
     fn malformed_i420_is_rejected() {
         assert!(VideoFrame::new_i420(2, 2, vec![0; 5], 0).rgb().is_err());
         assert!(VideoFrame::new_i420(3, 2, vec![0; 9], 0).rgb().is_err());
+    }
+
+    #[test]
+    fn luma_signature_detects_local_tile_changes() {
+        let mut baseline = vec![16u8; 32 * 18 * 3 / 2];
+        let first = VideoFrame::new_i420(32, 18, baseline.clone(), 0)
+            .luma_signature()
+            .unwrap();
+        for row in 6..12 {
+            for column in 10..16 {
+                baseline[row * 32 + column] = 220;
+            }
+        }
+        let changed = VideoFrame::new_i420(32, 18, baseline, 0)
+            .luma_signature()
+            .unwrap();
+        assert_ne!(first, changed);
     }
 }

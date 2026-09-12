@@ -9,6 +9,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use tungstenite::client::IntoClientRequest;
 
 const DEFAULT_API: &str = "http://127.0.0.1:27180/api/v1";
 
@@ -66,14 +67,15 @@ struct Metrics {
     preview_profile: String,
 }
 #[derive(Clone, Deserialize)]
-struct SessionSnapshot {
+struct SessionStateSnapshot {
     serial: String,
-    metrics: Metrics,
+    #[serde(default)]
+    preview_mode: String,
 }
 #[derive(Deserialize)]
 struct StateSnapshot {
     devices: Vec<Device>,
-    sessions: Vec<SessionSnapshot>,
+    sessions: Vec<SessionStateSnapshot>,
     runs: Vec<ScriptRun>,
     scripts: Vec<String>,
 }
@@ -103,9 +105,7 @@ enum Command {
     Connect(String),
     DiscoverPairingServices,
     Pair(String, String),
-    StartSession(String),
     StopSession(String),
-    StartAll,
     StopAllSessions,
     SetMode(String, Mode),
     SetScriptProfile(String, String),
@@ -133,6 +133,13 @@ struct DecodedFrame {
 }
 type LatestFrames = Arc<Mutex<HashMap<String, DecodedFrame>>>;
 
+#[derive(Default)]
+struct Visibility {
+    ready: bool,
+    serials: HashSet<String>,
+}
+type VisibleSerials = Arc<Mutex<Visibility>>;
+
 fn store_decoded_frame(latest_frames: &LatestFrames, serial: String, frame: DecodedFrame) {
     latest_frames
         .lock()
@@ -155,9 +162,10 @@ fn store_latest_frame(latest_frames: &LatestFrames, serial: String, bytes: Vec<u
 }
 
 struct App {
-    commands: mpsc::Sender<Command>,
+    commands: mpsc::SyncSender<Command>,
     events: mpsc::Receiver<Event>,
     latest_frames: LatestFrames,
+    visible_serials: VisibleSerials,
     devices: Vec<Device>,
     scripts: Vec<String>,
     runs: HashMap<String, ScriptRun>,
@@ -183,15 +191,25 @@ struct App {
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         configure(&cc.egui_ctx);
-        let (commands, rx) = mpsc::channel();
-        let (tx, events) = mpsc::channel();
+        // Bounded channels keep a slow backend or a paused UI from retaining
+        // an unbounded backlog of stale refresh and preview events.
+        let (commands, rx) = mpsc::sync_channel(128);
+        let (tx, events) = mpsc::sync_channel(256);
         let latest_frames = LatestFrames::default();
-        spawn_backend(rx, tx, latest_frames.clone(), cc.egui_ctx.clone());
-        let _ = commands.send(Command::Refresh);
+        let visible_serials = VisibleSerials::default();
+        spawn_backend(
+            rx,
+            tx,
+            latest_frames.clone(),
+            visible_serials.clone(),
+            cc.egui_ctx.clone(),
+        );
+        let _ = commands.try_send(Command::Refresh);
         Self {
             commands,
             events,
             latest_frames,
+            visible_serials,
             devices: vec![],
             scripts: vec![],
             runs: HashMap::new(),
@@ -214,6 +232,13 @@ impl App {
             status: "正在连接后端…".into(),
             last_tick: Instant::now(),
         }
+    }
+    fn queue_command(&self, command: Command) {
+        // UI callbacks must never wait for a backend request that may be
+        // blocked on a device. Dropping a stale refresh is harmless; control
+        // commands are bounded by the same queue and the next state refresh
+        // makes their result visible.
+        let _ = self.commands.try_send(command);
     }
     fn receive(&mut self, ctx: &Context) -> bool {
         let mut changed = false;
@@ -244,7 +269,7 @@ impl App {
                         Ok(()) => {
                             self.pairing_open = false;
                             self.status = "无线调试配对成功".into();
-                            let _ = self.commands.send(Command::Refresh);
+                            self.queue_command(Command::Refresh);
                         }
                         Err(error) => {
                             self.pairing_status = format!("配对失败：{error}");
@@ -261,7 +286,9 @@ impl App {
                 }
                 Event::Sessions(v) => {
                     for serial in &v {
-                        self.modes.entry(serial.clone()).or_insert(Mode::Realtime);
+                        self.modes
+                            .entry(serial.clone())
+                            .or_insert(Mode::FiveSeconds);
                     }
                     self.sessions = v.into_iter().collect();
                     self.textures
@@ -305,13 +332,24 @@ impl eframe::App for App {
     #[allow(clippy::possible_missing_else)]
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        let commands = self.commands.clone();
+        let visible_serials = self.visible_serials.clone();
+        {
+            let mut visibility = visible_serials.lock().unwrap();
+            // The backend treats the short interval before the current frame
+            // is painted as visible-all. This avoids tearing down a stream
+            // during a scroll/layout pass, then narrows demand once cards are
+            // measured against the actual clip rectangle below.
+            visibility.ready = false;
+            visibility.serials.clear();
+        }
         let window_active = viewport_active(&ctx);
         if self.receive(&ctx) && window_active {
             ctx.request_repaint();
         }
         if window_active && !self.pairing_busy && self.last_tick.elapsed() > Duration::from_secs(2)
         {
-            let _ = self.commands.send(Command::Refresh);
+            let _ = commands.try_send(Command::Refresh);
             self.last_tick = Instant::now();
         }
         egui::Frame::NONE.show(ui, |ui| {
@@ -321,16 +359,13 @@ impl eframe::App for App {
                 ui.separator();
                 ui.label(&self.status);
                 if ui.button("刷新").clicked() {
-                    let _ = self.commands.send(Command::Refresh);
-                }
-                if ui.button("启动全部会话").clicked() {
-                    let _ = self.commands.send(Command::StartAll);
+                    let _ = commands.try_send(Command::Refresh);
                 }
                 if ui.button("停止全部会话").clicked() {
-                    let _ = self.commands.send(Command::StopAllSessions);
+                    let _ = commands.try_send(Command::StopAllSessions);
                 }
                 if ui.button("停止全部脚本").clicked() {
-                    let _ = self.commands.send(Command::StopAllScripts);
+                    let _ = commands.try_send(Command::StopAllScripts);
                 }
             });
             ui.horizontal(|ui| {
@@ -344,15 +379,13 @@ impl eframe::App for App {
                 let submit = ui.button("连接").clicked()
                     || (edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)));
                 if submit && !self.endpoint.trim().is_empty() {
-                    let _ = self
-                        .commands
-                        .send(Command::Connect(self.endpoint.trim().to_owned()));
+                    let _ = commands.try_send(Command::Connect(self.endpoint.trim().to_owned()));
                 }
                 if ui.button("无线配对").clicked() {
                     self.pairing_open = true;
                     self.pairing_code.clear();
                     self.pairing_status = "正在搜索附近的配对服务…".into();
-                    let _ = self.commands.send(Command::DiscoverPairingServices);
+                    let _ = commands.try_send(Command::DiscoverPairingServices);
                 }
             });
             ui.add_space(6.0);
@@ -400,7 +433,7 @@ impl eframe::App for App {
                         .clicked()
                     {
                         self.pairing_status = "正在搜索附近的配对服务…".into();
-                        let _ = self.commands.send(Command::DiscoverPairingServices);
+                        let _ = commands.try_send(Command::DiscoverPairingServices);
                     }
                     ui.add_space(6.0);
                     ui.label("配对地址");
@@ -444,7 +477,7 @@ impl eframe::App for App {
                             let code = std::mem::take(&mut self.pairing_code);
                             self.pairing_busy = true;
                             self.pairing_status = "正在配对并查找连接端口…".into();
-                            let _ = self.commands.send(Command::Pair(endpoint, code));
+                            let _ = commands.try_send(Command::Pair(endpoint, code));
                         }
                         if ui
                             .add_enabled(!self.pairing_busy, egui::Button::new("取消"))
@@ -463,18 +496,19 @@ impl eframe::App for App {
         egui::Frame::central_panel(ui.style()).show(ui,|ui|{egui::ScrollArea::vertical().show(ui,|ui|{if self.devices.is_empty(){ui.vertical_centered(|ui|{ui.add_space(80.0);ui.heading("未发现设备");ui.label("请连接 USB 或无线 ADB 设备");});return;}
    let columns=if ui.available_width()<620.0{1}else if ui.available_width()<980.0{2}else{3};let width=(ui.available_width()-12.0*(columns-1)as f32)/columns as f32;
    for row in self.devices.chunks(columns){ui.horizontal_top(|ui|{for device in row{let serial=&device.serial;let session_running=self.sessions.contains(serial);let run=self.runs.get(serial);
-    ui.allocate_ui_with_layout(egui::vec2(width,ui.available_height()),egui::Layout::top_down(egui::Align::Center),|ui|{egui::Frame::group(ui.style()).show(ui,|ui|{ui.set_width(width-16.0);let aspect=self.textures.get(serial).map(|t|t.aspect_ratio()).unwrap_or(0.5);let h=((width-24.0)/aspect).min(520.0);
+    let card_response=ui.allocate_ui_with_layout(egui::vec2(width,ui.available_height()),egui::Layout::top_down(egui::Align::Center),|ui|{egui::Frame::group(ui.style()).show(ui,|ui|{ui.set_width(width-16.0);let aspect=self.textures.get(serial).map(|t|t.aspect_ratio()).unwrap_or(0.5);let h=((width-24.0)/aspect).min(520.0);
      if let Some(texture)=self.textures.get(serial){let pixels=texture.size();let response=ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(width-24.0,h)).sense(egui::Sense::click_and_drag()));let inspect=*self.inspect.entry(serial.clone()).or_insert(Inspect::None);if inspect==Inspect::Point&&response.clicked(){if let Some(pos)=response.interact_pointer_pos(){self.points.insert(serial.clone(),screen_to_pixel(pos,response.rect,pixels));}}
-      if inspect==Inspect::Region{if response.drag_started(){if let Some(pos)=response.interact_pointer_pos(){self.drag_starts.insert(serial.clone(),pos);}}if let(Some(start),Some(current))=(self.drag_starts.get(serial).copied(),response.interact_pointer_pos()){let rect=egui::Rect::from_two_pos(start,current).intersect(response.rect);ui.painter().rect_stroke(rect,0.0_f32,egui::Stroke::new(2.0_f32,egui::Color32::LIGHT_GREEN),egui::StrokeKind::Inside);}if response.drag_stopped(){if let(Some(start),Some(end))=(self.drag_starts.remove(serial),response.interact_pointer_pos()){let(a,b)=(screen_to_pixel(start,response.rect,pixels),screen_to_pixel(end,response.rect,pixels));let(x1,x2)=(a.0.min(b.0),a.0.max(b.0));let(y1,y2)=(a.1.min(b.1),a.1.max(b.1));if x2>x1&&y2>y1{let path=self.paths.entry(serial.clone()).or_insert_with(||default_template_name(serial)).clone();let _=self.commands.send(Command::SaveRegion(serial.clone(),path,x1,y1,x2,y2));}}}}
-     }else{ui.allocate_ui(egui::vec2(width-24.0,h.min(360.0)),|ui|{ui.centered_and_justified(|ui|{ui.label(if session_running{"等待视频帧"}else{"会话未启动"});});});}
-     ui.horizontal(|ui|{ui.strong(device.model.as_deref().unwrap_or(serial));ui.label(if device.wireless{"无线"}else{"USB"});ui.label(if session_running{"● 会话运行中"}else{"○ 会话停止"});});ui.small(format!("{} · {}",serial,device.state));
-     ui.horizontal_wrapped(|ui|{if !session_running{if ui.button("启动会话").clicked(){let _=self.commands.send(Command::StartSession(serial.clone()));}}else if ui.button("停止会话").clicked(){let _=self.commands.send(Command::StopSession(serial.clone()));}let mode=self.modes.entry(serial.clone()).or_insert(Mode::Realtime);egui::ComboBox::from_id_salt(format!("mode-{serial}")).selected_text(match mode{Mode::Realtime=>"实时预览",Mode::FiveSeconds=>"五秒一图",Mode::Off=>"关闭预览"}).show_ui(ui,|ui|{for(value,label)in[(Mode::Realtime,"实时预览"),(Mode::FiveSeconds,"五秒一图"),(Mode::Off,"关闭预览")]{if ui.selectable_value(mode,value,label).changed(){let _=self.commands.send(Command::SetMode(serial.clone(),value));}}});});
-     if let Some(metric)=self.metrics.get(serial){ui.small(format!("解码 {:.1} · 预览 {:.1} · 脚本 {:.1} FPS｜均值 {:.1}ms · P50 {:.1} · P95 {:.1} · 脚本丢帧 {} · 预览丢帧 {} · 重检 {} · 发布 {}μs · 输入 {}μs（失败 {}）· 视频错误 {} · 帧序 {} · {} 租约 {}",metric.decoded_fps,metric.preview_fps,metric.script_fps,metric.average_script_ms,metric.script_p50_ms,metric.script_p95_ms,metric.dropped_script_frames,metric.preview_dropped_frames,metric.script_rescans,metric.last_publish_us,metric.last_input_us,metric.input_failures,metric.video_packet_errors+metric.video_decode_errors,metric.latest_frame_seq,metric.activity_state,metric.preview_leases));ui.horizontal_wrapped(|ui|{let mut script_profile=metric.profile.clone();egui::ComboBox::from_id_salt(format!("script-profile-{serial}")).selected_text(format!("脚本：{}",script_profile)).show_ui(ui,|ui|{for(value,label)in[("auto","自动"),("eco","节能"),("balanced","均衡"),("realtime","实时")]{if ui.selectable_value(&mut script_profile,value.to_owned(),label).changed(){let _=self.commands.send(Command::SetScriptProfile(serial.clone(),value.to_owned()));}}});let mut preview_profile=metric.preview_profile.clone();egui::ComboBox::from_id_salt(format!("preview-profile-{serial}")).selected_text(format!("预览：{}",preview_profile)).show_ui(ui,|ui|{for(value,label)in[("auto","自动"),("eco","节能"),("balanced","均衡"),("realtime","实时")]{if ui.selectable_value(&mut preview_profile,value.to_owned(),label).changed(){let _=self.commands.send(Command::SetPreviewProfile(serial.clone(),value.to_owned()));}}});});}
+      if inspect==Inspect::Region{if response.drag_started(){if let Some(pos)=response.interact_pointer_pos(){self.drag_starts.insert(serial.clone(),pos);}}if let(Some(start),Some(current))=(self.drag_starts.get(serial).copied(),response.interact_pointer_pos()){let rect=egui::Rect::from_two_pos(start,current).intersect(response.rect);ui.painter().rect_stroke(rect,0.0_f32,egui::Stroke::new(2.0_f32,egui::Color32::LIGHT_GREEN),egui::StrokeKind::Inside);}if response.drag_stopped(){if let(Some(start),Some(end))=(self.drag_starts.remove(serial),response.interact_pointer_pos()){let(a,b)=(screen_to_pixel(start,response.rect,pixels),screen_to_pixel(end,response.rect,pixels));let(x1,x2)=(a.0.min(b.0),a.0.max(b.0));let(y1,y2)=(a.1.min(b.1),a.1.max(b.1));if x2>x1&&y2>y1{let path=self.paths.entry(serial.clone()).or_insert_with(||default_template_name(serial)).clone();let _=commands.try_send(Command::SaveRegion(serial.clone(),path,x1,y1,x2,y2));}}}}
+     }else{ui.allocate_ui(egui::vec2(width-24.0,h.min(360.0)),|ui|{ui.centered_and_justified(|ui|{ui.label(if session_running{"等待视频帧"}else{"会话自动启动中"});});});}
+     ui.horizontal(|ui|{ui.strong(device.model.as_deref().unwrap_or(serial));ui.label(if device.wireless{"无线"}else{"USB"});ui.label(if session_running{"● 会话运行中"}else{"○ 会话自动启动中"});});ui.small(format!("{} · {}",serial,device.state));
+     ui.horizontal_wrapped(|ui|{if !session_running{ui.label("会话自动启动中");}else if ui.button("停止会话").clicked(){let _=commands.try_send(Command::StopSession(serial.clone()));}let mode=self.modes.entry(serial.clone()).or_insert(Mode::FiveSeconds);egui::ComboBox::from_id_salt(format!("mode-{serial}")).selected_text(match mode{Mode::Realtime=>"实时预览",Mode::FiveSeconds=>"五秒一图",Mode::Off=>"关闭预览"}).show_ui(ui,|ui|{for(value,label)in[(Mode::Realtime,"实时预览"),(Mode::FiveSeconds,"五秒一图"),(Mode::Off,"关闭预览")]{if ui.selectable_value(mode,value,label).changed(){let _=commands.try_send(Command::SetMode(serial.clone(),value));}}});});
+     if let Some(metric)=self.metrics.get(serial){ui.small(format!("解码 {:.1} · 预览 {:.1} · 脚本 {:.1} FPS｜均值 {:.1}ms · P50 {:.1} · P95 {:.1} · 脚本丢帧 {} · 预览丢帧 {} · 重检 {} · 发布 {}μs · 输入 {}μs（失败 {}）· 视频错误 {} · 帧序 {} · {} 租约 {}",metric.decoded_fps,metric.preview_fps,metric.script_fps,metric.average_script_ms,metric.script_p50_ms,metric.script_p95_ms,metric.dropped_script_frames,metric.preview_dropped_frames,metric.script_rescans,metric.last_publish_us,metric.last_input_us,metric.input_failures,metric.video_packet_errors+metric.video_decode_errors,metric.latest_frame_seq,metric.activity_state,metric.preview_leases));ui.horizontal_wrapped(|ui|{let mut script_profile=metric.profile.clone();egui::ComboBox::from_id_salt(format!("script-profile-{serial}")).selected_text(format!("脚本：{}",script_profile)).show_ui(ui,|ui|{for(value,label)in[("auto","自动"),("eco","节能"),("balanced","均衡"),("realtime","实时")]{if ui.selectable_value(&mut script_profile,value.to_owned(),label).changed(){let _=commands.try_send(Command::SetScriptProfile(serial.clone(),value.to_owned()));}}});let mut preview_profile=metric.preview_profile.clone();egui::ComboBox::from_id_salt(format!("preview-profile-{serial}")).selected_text(format!("预览：{}",preview_profile)).show_ui(ui,|ui|{for(value,label)in[("auto","自动"),("eco","节能"),("balanced","均衡"),("realtime","实时")]{if ui.selectable_value(&mut preview_profile,value.to_owned(),label).changed(){let _=commands.try_send(Command::SetPreviewProfile(serial.clone(),value.to_owned()));}}});});}
      ui.horizontal_wrapped(|ui|{let inspect=self.inspect.entry(serial.clone()).or_insert(Inspect::None);if ui.selectable_label(*inspect==Inspect::Point,"点选坐标").clicked(){*inspect=if *inspect==Inspect::Point{Inspect::None}else{Inspect::Point};}if ui.selectable_label(*inspect==Inspect::Region,"框选模板").clicked(){*inspect=if *inspect==Inspect::Region{Inspect::None}else{Inspect::Region};}if let Some((x,y))=self.points.get(serial){ui.label(format!("坐标：{x}, {y}"));}});
      ui.horizontal(|ui|{ui.label("保存位置");ui.add(egui::TextEdit::singleline(self.paths.entry(serial.clone()).or_insert_with(||default_template_name(serial))).id_source(("template-path",serial)));});
-     ui.separator();ui.horizontal_wrapped(|ui|{let default=self.scripts.first().cloned().unwrap_or_default();let choice=self.selected.entry(serial.clone()).or_insert(default);egui::ComboBox::from_id_salt(format!("script-{serial}")).selected_text(if choice.is_empty(){"无可用脚本"}else{choice.as_str()}).show_ui(ui,|ui|{for name in &self.scripts{ui.selectable_value(choice,name.clone(),name);}});if let Some(active)=run{ui.colored_label(if active.stalled{egui::Color32::LIGHT_RED}else{egui::Color32::LIGHT_GREEN},format!("{} {}",if active.stalled{"⚠ 疑似卡顿"}else{"●"},active.name.as_deref().unwrap_or("脚本"))).on_hover_text(format!("运行 ID: {}",active.run_id));if ui.button("停止脚本").clicked(){let _=self.commands.send(Command::StopScript(serial.clone()));}}else{let enabled=session_running&&!choice.is_empty();if ui.add_enabled(enabled,egui::Button::new("运行脚本")).clicked(){let _=self.commands.send(Command::RunScript(serial.clone(),choice.clone()));}}});
-    });});}});ui.add_space(10.0);}
+     ui.separator();ui.horizontal_wrapped(|ui|{let default=self.scripts.first().cloned().unwrap_or_default();let choice=self.selected.entry(serial.clone()).or_insert(default);egui::ComboBox::from_id_salt(format!("script-{serial}")).selected_text(if choice.is_empty(){"无可用脚本"}else{choice.as_str()}).show_ui(ui,|ui|{for name in &self.scripts{ui.selectable_value(choice,name.clone(),name);}});if let Some(active)=run{ui.colored_label(if active.stalled{egui::Color32::LIGHT_RED}else{egui::Color32::LIGHT_GREEN},format!("{} {}",if active.stalled{"⚠ 疑似卡顿"}else{"●"},active.name.as_deref().unwrap_or("脚本"))).on_hover_text(format!("运行 ID: {}",active.run_id));if ui.button("停止脚本").clicked(){let _=commands.try_send(Command::StopScript(serial.clone()));}}else{let enabled=session_running&&!choice.is_empty();if ui.add_enabled(enabled,egui::Button::new("运行脚本")).clicked(){let _=commands.try_send(Command::RunScript(serial.clone(),choice.clone()));}}});
+    });});if card_response.response.rect.intersects(ui.clip_rect()){visible_serials.lock().unwrap().serials.insert(serial.clone());}}});ui.add_space(10.0);}
   });});
+        visible_serials.lock().unwrap().ready = true;
         if window_active {
             ctx.request_repaint_after(Duration::from_secs(1));
         }
@@ -485,6 +519,11 @@ fn viewport_active(ctx: &Context) -> bool {
     ctx.input(|input| {
         input.viewport().visible().unwrap_or(true) && input.viewport().focused.unwrap_or(true)
     })
+}
+
+fn preview_visible(visibility: &VisibleSerials, serial: &str) -> bool {
+    let visibility = visibility.lock().unwrap();
+    !visibility.ready || visibility.serials.contains(serial)
 }
 
 fn configure(ctx: &Context) {
@@ -558,8 +597,9 @@ fn endpoint_looks_valid(endpoint: &str) -> bool {
 }
 fn spawn_backend(
     commands: mpsc::Receiver<Command>,
-    events: mpsc::Sender<Event>,
+    events: mpsc::SyncSender<Event>,
     latest_frames: LatestFrames,
+    visible_serials: VisibleSerials,
     ctx: Context,
 ) {
     thread::spawn(move || {
@@ -567,6 +607,7 @@ fn spawn_backend(
         let client = reqwest::blocking::Client::builder()
             .no_proxy()
             .timeout(Duration::from_secs(15))
+            .default_headers(auth_headers())
             .build()
             .unwrap();
         let mut modes: HashMap<String, (Mode, Instant)> = HashMap::new();
@@ -598,38 +639,41 @@ fn spawn_backend(
                                 .iter()
                                 .map(|session| session.serial.clone())
                                 .collect::<Vec<_>>();
-                            let metrics = session_snapshots
-                                .into_iter()
-                                .map(|session| (session.serial, session.metrics))
-                                .collect::<HashMap<_, _>>();
-                            for serial in &se {
-                                modes.entry(serial.clone()).or_insert((
-                                    Mode::Realtime,
-                                    Instant::now() - Duration::from_secs(10),
-                                ));
+                            for session in &session_snapshots {
+                                let mode = match session.preview_mode.as_str() {
+                                    "off" => Mode::Off,
+                                    "five_seconds" => Mode::FiveSeconds,
+                                    _ => Mode::FiveSeconds,
+                                };
+                                modes
+                                    .entry(session.serial.clone())
+                                    .or_insert((mode, Instant::now() - Duration::from_secs(10)));
                             }
                             modes.retain(|serial, _| se.contains(serial));
                             latest_frames
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .retain(|serial, _| se.contains(serial));
-                            for (serial, metric) in &metrics {
-                                preview_profiles
-                                    .insert(serial.clone(), metric.preview_profile.clone());
-                            }
                             preview_profiles.retain(|serial, _| se.contains(serial));
                             frame_etags.retain(|serial, _| se.contains(serial));
-                            let _ = events.send(Event::Devices(d));
-                            let _ = events.send(Event::Scripts(sc));
-                            let _ = events.send(Event::Runs(r));
-                            let _ = events.send(Event::Sessions(se));
-                            let _ = events.send(Event::Metrics(metrics));
-                            let _ = events.send(Event::Status("后端运行中".into()));
+                            let _ = events.try_send(Event::Devices(d));
+                            let _ = events.try_send(Event::Scripts(sc));
+                            let _ = events.try_send(Event::Runs(r));
+                            let _ = events.try_send(Event::Sessions(se));
+                            let _ = events.try_send(Event::Status("后端运行中".into()));
                         }
                         Ok(None) => {}
                         _ => {
-                            let _ = events.send(Event::Status("后端不可用".into()));
+                            let _ = events.try_send(Event::Status("后端不可用".into()));
                         }
+                    }
+                    if let Ok(metrics) =
+                        get::<HashMap<String, Metrics>>(&client, &format!("{api}/metrics"))
+                    {
+                        for (serial, metric) in &metrics {
+                            preview_profiles.insert(serial.clone(), metric.preview_profile.clone());
+                        }
+                        let _ = events.try_send(Event::Metrics(metrics));
                     }
                 }
                 Ok(Command::Connect(endpoint)) => {
@@ -638,7 +682,7 @@ fn spawn_backend(
                         &format!("{api}/devices/connect"),
                         serde_json::json!({"endpoint":endpoint}),
                     );
-                    let _ = events.send(Event::Status(match result {
+                    let _ = events.try_send(Event::Status(match result {
                         Ok(()) => format!("已连接 {endpoint}"),
                         Err(e) => format!("连接失败：{e}"),
                     }));
@@ -649,7 +693,7 @@ fn spawn_backend(
                         &format!("{api}/devices/pairing-services"),
                     )
                     .map_err(|error| error.to_string());
-                    let _ = events.send(Event::PairingServices(result));
+                    let _ = events.try_send(Event::PairingServices(result));
                 }
                 Ok(Command::Pair(endpoint, code)) => {
                     let result = client
@@ -660,11 +704,11 @@ fn spawn_backend(
                         .and_then(|response| response.json::<Vec<Device>>());
                     match result {
                         Ok(devices) => {
-                            let _ = events.send(Event::Devices(devices));
-                            let _ = events.send(Event::PairingFinished(Ok(())));
+                            let _ = events.try_send(Event::Devices(devices));
+                            let _ = events.try_send(Event::PairingFinished(Ok(())));
                         }
                         Err(error) => {
-                            let _ = events.send(Event::PairingFinished(Err(error.to_string())));
+                            let _ = events.try_send(Event::PairingFinished(Err(error.to_string())));
                         }
                     }
                 }
@@ -675,7 +719,7 @@ fn spawn_backend(
                         serde_json::json!({"profile":profile}),
                     );
                     if let Err(e) = result {
-                        let _ = events.send(Event::Status(format!("脚本性能设置失败：{e}")));
+                        let _ = events.try_send(Event::Status(format!("脚本性能设置失败：{e}")));
                     }
                 }
                 Ok(Command::SetPreviewProfile(serial, profile)) => {
@@ -687,26 +731,7 @@ fn spawn_backend(
                     if result.is_ok() {
                         preview_profiles.insert(serial, profile);
                     } else if let Err(e) = result {
-                        let _ = events.send(Event::Status(format!("预览性能设置失败：{e}")));
-                    }
-                }
-                Ok(Command::StartSession(serial)) => {
-                    let result = post(
-                        &client,
-                        &format!("{api}/sessions/{}/start", url(&serial)),
-                        serde_json::json!({}),
-                    );
-                    let started = result.is_ok();
-                    let status = match result {
-                        Ok(()) => format!("{serial} 会话已启动"),
-                        Err(error) => format!("启动失败：{error}"),
-                    };
-                    let _ = events.send(Event::Status(status));
-                    if started {
-                        modes.insert(
-                            serial,
-                            (Mode::Realtime, Instant::now() - Duration::from_secs(10)),
-                        );
+                        let _ = events.try_send(Event::Status(format!("预览性能设置失败：{e}")));
                     }
                 }
                 Ok(Command::StopSession(serial)) => {
@@ -722,9 +747,6 @@ fn spawn_backend(
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&serial);
                     frame_etags.remove(&serial);
-                }
-                Ok(Command::StartAll) => {
-                    let _ = client.post(format!("{api}/sessions/start-all")).send();
                 }
                 Ok(Command::StopAllSessions) => {
                     let _ = client.post(format!("{api}/sessions/stop-all")).send();
@@ -751,7 +773,7 @@ fn spawn_backend(
                         Ok(()) => format!("{serial} 脚本已启动"),
                         Err(error) => format!("脚本启动失败：{error}"),
                     };
-                    let _ = events.send(Event::Status(status));
+                    let _ = events.try_send(Event::Status(status));
                 }
                 Ok(Command::StopScript(serial)) => {
                     let _ = client
@@ -772,10 +794,10 @@ fn spawn_backend(
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("模板")
                                 .to_owned();
-                            let _ = events.send(Event::Saved(serial, saved));
+                            let _ = events.try_send(Event::Saved(serial, saved));
                         }
                         Err(e) => {
-                            let _ = events.send(Event::Status(format!("模板保存失败：{e}")));
+                            let _ = events.try_send(Event::Status(format!("模板保存失败：{e}")));
                         }
                     }
                 }
@@ -812,13 +834,19 @@ fn spawn_backend(
                 continue;
             }
             streams.retain(|serial, token| {
-                modes
+                let keep = modes
                     .get(serial)
                     .is_some_and(|(mode, _)| *mode == Mode::Realtime)
-                    && token.load(Ordering::Relaxed)
+                    && preview_visible(&visible_serials, serial)
+                    && token.load(Ordering::Relaxed);
+                if !keep {
+                    token.store(false, Ordering::Relaxed);
+                }
+                keep
             });
             for (serial, (mode, last)) in &mut modes {
                 if *mode == Mode::Realtime
+                    && preview_visible(&visible_serials, serial)
                     && !streams.contains_key(serial)
                     && last.elapsed() >= Duration::from_secs(1)
                 {
@@ -835,8 +863,9 @@ fn spawn_backend(
                 }
             }
             for (serial, (mode, last)) in &mut modes {
-                let due =
-                    matches!(mode, Mode::FiveSeconds) && last.elapsed() >= Duration::from_secs(5);
+                let due = matches!(mode, Mode::FiveSeconds)
+                    && preview_visible(&visible_serials, serial)
+                    && last.elapsed() >= Duration::from_secs(5);
                 if due {
                     let mut request =
                         client.get(format!("{api}/sessions/{}/frame.jpg", url(serial)));
@@ -889,7 +918,21 @@ fn spawn_preview_ws(
             api
         };
         let endpoint = format!("{base}/sessions/{}/preview", url(&serial));
-        if let Ok((mut socket, _)) = tungstenite::connect(endpoint.as_str()) {
+        let mut request = match endpoint.as_str().into_client_request() {
+            Ok(request) => request,
+            Err(_) => {
+                running.store(false, Ordering::Relaxed);
+                return;
+            }
+        };
+        if let Some(token) = std::env::var_os("SCRCPYFORGE_AUTH_TOKEN") {
+            if let Ok(value) = format!("Bearer {}", token.to_string_lossy()).parse() {
+                request
+                    .headers_mut()
+                    .insert(reqwest::header::AUTHORIZATION.as_str(), value);
+            }
+        }
+        if let Ok((mut socket, _)) = tungstenite::connect(request) {
             if let tungstenite::stream::MaybeTlsStream::Plain(stream) = socket.get_mut() {
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(250)));
             }
@@ -927,6 +970,16 @@ fn get<T: serde::de::DeserializeOwned>(
     url: &str,
 ) -> Result<T, reqwest::Error> {
     client.get(url).send()?.error_for_status()?.json()
+}
+
+fn auth_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = std::env::var_os("SCRCPYFORGE_AUTH_TOKEN") {
+        if let Ok(value) = format!("Bearer {}", token.to_string_lossy()).parse() {
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+    }
+    headers
 }
 fn get_state<T: serde::de::DeserializeOwned>(
     client: &reqwest::blocking::Client,

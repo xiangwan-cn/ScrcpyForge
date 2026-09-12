@@ -3,4 +3,13 @@ set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 opencv_lib="$root/third_party/opencv-root/usr/lib"
 export LD_LIBRARY_PATH="$opencv_lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+runtime_dir=${XDG_RUNTIME_DIR:-/tmp}
+mkdir -p "$runtime_dir"
+lock_file="$runtime_dir/scrcpyforge-daemon.lock"
+if command -v flock >/dev/null 2>&1; then
+    # Let flock keep the lock in its supervisor process, but close the lock
+    # descriptor before exec'ing the daemon. Otherwise the daemon's long-lived
+    # ADB child can inherit the descriptor and keep the lock after shutdown.
+    exec flock -n --close "$lock_file" "$root/target/release/forge-daemon" "$@"
+fi
 exec "$root/target/release/forge-daemon" "$@"

@@ -18,13 +18,34 @@ Production scripts should normally use the `auto` profile. Prefer ROI tracking
 when the workflow permits it, and enable preview only when an operator needs it;
 preview JPEG encoding is intentionally independent from script processing.
 
+The desktop client marks only cards intersecting the scroll viewport as preview
+consumers. Scrolling a card away releases its WebSocket lease and prevents its
+five-second screenshot request until it returns; a hidden or unfocused window
+releases every lease.
+
+When all consumers release their leases, a session remains warm briefly and
+then enters `suspended`: encoded packets are discarded before FFmpeg and no
+RGB/JPEG work runs. After the deep-idle window the daemon stops the scrcpy
+server and its ADB forwards. A new demand reactivates a warm session; for
+connected devices, the daemon's background scan recreates a dead session
+automatically. Measure warm versus cold resume separately when tuning this
+tradeoff.
+
 The runtime exposes `SCRCPYFORGE_CV_THREADS` and
 `SCRCPYFORGE_DECODE_THREADS`/`SCRCPYFORGE_DECODE_THREAD_TYPE` so a multi-device
 host can keep OpenCV and FFmpeg within one CPU budget. `SCRCPYFORGE_ADB_TIMEOUT_MS`
-puts a bound on control-plane subprocesses. `/api/v1/state` returns session
-metrics in one snapshot; compare `latest_frame_age_ms`, `last_publish_us`,
-`script_rescans`, `input_failures`, and video error counters before tuning a
-matching threshold.
+puts a bound on control-plane subprocesses. `/api/v1/state` contains stable
+session state, while `/api/v1/metrics` contains rolling counters. Compare
+`latest_frame_age_ms`, `last_publish_us`, `script_rescans`, `input_failures`,
+and video error counters before tuning a matching threshold.
+
+For energy measurements, hold device brightness, network, temperature, and
+scene constant. Compare ten-minute windows with no consumers, a hidden Web
+page, and an active script. On Linux record CPU time and the powercap
+`energy_uj` delta when available; on Android record the scrcpy/MediaCodec
+process state and a fixed Perfetto or batterystats window. Report repeated runs
+with the exact profile and frame dimensions instead of inferring savings from
+FPS alone.
 
 For tracking A/B runs, compare full-screen matching with tracking enabled on the
 same captured frames. Include a static screen after script attach, a target move

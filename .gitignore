@@ -4,5 +4,6 @@
 .env
 *.log
 *.swp
+.scrcpyforge-vision-roi.state
 .idea/
 .vscode/

@@ -1,20 +1,38 @@
 # Local API v1
 
-Default base URL: `http://127.0.0.1:27180/api/v1`
+Default local base URL: `http://127.0.0.1:27180/api/v1`. For LAN clients,
+replace the host with the daemon's LAN address.
 
 All request and response bodies are JSON unless a route states otherwise.
 Serials are path parameters and must be URL-encoded (wireless and IPv6 serials
 can contain `:`, `[` and `]`). Successful action-only responses generally use
 `204 No Content` or `202 Accepted`.
 
-Errors produced by handlers have status `500` and the form:
+Errors use an HTTP status and the form:
 
 ```json
-{"error":"human-readable message"}
+{"error":{"code":"invalid_request","message":"human-readable message","request_id":"…"}}
 ```
 
-The API currently has no authentication and permits CORS from any origin. Keep
-the daemon bound to loopback unless it is protected by a trusted access layer.
+Every response carries an `X-Request-Id` header. Include it when reporting a
+failure so the matching server log entry can be located without exposing
+request bodies or credentials.
+
+`400` is used for invalid input, `404` for a missing device/session/script,
+`409` for a state conflict, `429` for a busy or rate-limited request, and
+`500` for an unexpected server error (whose response message is deliberately
+generic; details are logged server-side). The daemon accepts at most 512 KiB per
+request body; scripts are limited to 512 KiB, text input to 4 KiB, swipe and
+long-press duration to 60 seconds, tap randomization radius to 4096 pixels,
+and multi-touch to 10 pointers. Named script directories are limited to 128
+bytes and template paths to 1024 bytes.
+
+The default listener is `0.0.0.0:27180` for LAN template acquisition. Without a
+token, a browser `Origin` that does not match the request host is rejected, but
+direct LAN clients can still call the API. Set `SCRCPYFORGE_AUTH_TOKEN` to a
+random value of at least 16 bytes to require `Authorization: Bearer <token>` on
+every non-public route. The health and root UI routes remain public; there is no
+wildcard CORS policy.
 
 ## Service
 
@@ -34,12 +52,14 @@ profiles supported by this daemon.
 
 ### `GET /state`
 
-Returns one consistent snapshot for clients that need devices, running sessions,
-session metrics, active script runs, and available named scripts. Desktop and
-browser clients should prefer this aggregate endpoint over issuing one request
-per device during refresh. The response includes an `ETag`; send it as
-`If-None-Match` to receive `304 Not Modified` when the stable state has not
-changed.
+Returns one consistent snapshot for devices, running sessions, active script
+runs, and available named scripts. Session entries contain only stable state,
+including the current preview mode;
+rolling counters and frame identity are served by the aggregate `/metrics`
+endpoint. Desktop and browser clients should prefer these two aggregate
+endpoints over issuing one request per device during refresh. The response
+includes an `ETag`; send it as `If-None-Match` to receive `304 Not Modified`
+when the stable state has not changed.
 
 ```json
 {
@@ -48,6 +68,17 @@ changed.
   "runs": [],
   "scripts": ["example_all_api"]
 }
+```
+
+### `GET /metrics`
+
+Returns the current metrics for every tracked session as an object keyed by
+serial. This representation is intentionally separate from `/state`, so its
+rolling FPS, frame sequence, and counters can update without invalidating the
+stable state ETag.
+
+```json
+{"DEVICE_SERIAL":{"decoded_fps":59.8,"latest_frame_seq":1200,"activity_state":"active"}}
 ```
 
 ### `POST /shutdown`
@@ -160,11 +191,10 @@ Returns the serials of running sessions.
 
 ### `POST /sessions/{serial}/start`
 
-All fields are optional. Unknown codec strings currently fall back to `h264`.
+All fields are optional. Unknown codec strings return `400`.
 
 ```json
 {
-  "server_jar":"/optional/path/scrcpy-server-v4.0.jar",
   "codec":"h264",
   "max_size":1280,
   "bit_rate":8000000,
@@ -172,11 +202,15 @@ All fields are optional. Unknown codec strings currently fall back to `h264`.
 }
 ```
 
-Defaults are H.264, maximum dimension 1280, 8 Mbps, 60 fps, automatic encoder,
-and stay-awake enabled. `profile` may be `eco`, `balanced`, or `realtime` to
+The server jar is selected by daemon configuration (`SCRCPYFORGE_SERVER_JAR`)
+and cannot be supplied by a request. Defaults are H.264, maximum dimension
+1280, 8 Mbps, 60 fps, automatic encoder, and stay-awake disabled. `profile`
+may be `eco`, `balanced`, or `realtime` to
 select the corresponding capture defaults; explicitly supplied size, bitrate,
 or FPS values take precedence. Starting an already-running session is
-idempotent.
+idempotent. The daemon automatically starts a default session when a connected
+device is discovered; this endpoint remains available for an explicit retry or
+capture override. New sessions use `five_seconds` preview mode by default.
 
 ```json
 {"device_name":"Android device","codec":"H264"}
@@ -190,6 +224,8 @@ Returns `204`, or `404` when no session exists.
 ### `POST /sessions/start-all`
 
 Starts default sessions concurrently for every device in the current snapshot.
+Connected devices are normally started automatically; this endpoint is useful
+for an explicit retry after a manual stop or a startup failure.
 
 ```json
 {"started":["SERIAL_A"],"failed":{"SERIAL_B":"error message"}}
@@ -197,7 +233,8 @@ Starts default sessions concurrently for every device in the current snapshot.
 
 ### `POST /sessions/stop-all`
 
-Stops scripts and sessions for all current devices. Returns `204 No Content`.
+Stops every tracked script and session, including sessions whose device has
+already disappeared from the latest ADB scan. Returns `204 No Content`.
 
 ### `POST /sessions/{serial}/preview-mode`
 
@@ -205,8 +242,8 @@ Stops scripts and sessions for all current devices. Returns `204 No Content`.
 {"mode":"realtime"}
 ```
 
-Modes are `realtime`, `five_seconds`, and `off`. An unknown value currently
-falls back to `realtime`. Returns `204 No Content`.
+Modes are `realtime`, `five_seconds`, and `off`. An unknown value returns `400`.
+Returns `204 No Content`.
 
 ### `POST /sessions/{serial}/script-profile`
 
@@ -271,17 +308,23 @@ active WebSocket/HTTP preview consumers, and `activity_state` is `active`,
 
 Returns the latest decoded frame as `image/jpeg` with an ETag derived from the
 session and `frame_seq`. Send `If-None-Match` to avoid re-encoding an unchanged
-frame and receive `304 Not Modified`. The session must have decoded at least
-one frame.
+frame and receive `304 Not Modified`. A request temporarily keeps frame demand
+active, including when preview mode is `off`, and waits up to three seconds for
+a fresh decoded frame after a suspended session resumes.
 
 ### `GET /sessions/{serial}/preview`
 
 Upgrades to WebSocket. Every binary message is one complete JPEG image. Frame
-frequency follows the preview mode/profile; slow clients may skip frames.
+frequency follows the preview mode/profile; slow clients may skip frames. The
+daemon limits preview and event WebSockets to 64 concurrent connections, uses
+a 5-second write timeout, and rejects event messages larger than 64 KiB or
+preview JPEGs larger than 8 MiB. The bundled browser page uses the still-frame
+route only while acquiring a template and does not keep preview WebSockets open.
 
 ### `POST /sessions/{serial}/regions`
 
-Crops the latest decoded frame and saves a PNG. Coordinates are
+Crops the latest decoded frame and saves a PNG. The capture request temporarily
+keeps frame demand active even when preview mode is `off`. Coordinates are
 `x1,y1,x2,y2`. Supply either a safe template `name` or `path`; `path` must be a
 relative `.png` path under the templates directory. Absolute paths, parent
 components, symbolic-link parents, and symbolic-link outputs are rejected.
@@ -348,7 +391,7 @@ Runs one named script on every currently active session.
 ```
 
 ```json
-{"run_ids":["550e8400-e29b-41d4-a716-446655440000"]}
+{"run_ids":["550e8400-e29b-41d4-a716-446655440000"],"failed":{}}
 ```
 
 ### `GET /scripts/runs`

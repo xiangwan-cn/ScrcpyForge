@@ -1,7 +1,13 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+};
 
 use anyhow::Result;
-use tokio::sync::{broadcast, Mutex, RwLock};
+use tokio::sync::{broadcast, Mutex, RwLock, Semaphore};
 
 use crate::{
     adb::Adb,
@@ -20,6 +26,13 @@ pub struct DeviceManager {
     // button click cannot start a second expensive discovery while the
     // background poll is still running.
     scan_gate: Arc<Mutex<()>>,
+    mdns_last_probe: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
+    stopping_all: Arc<AtomicBool>,
+    // Incremented whenever stop-all starts. A start that was already in the
+    // ADB/scrcpy connection phase must not insert its result after that stop
+    // operation has drained the session map.
+    start_epoch: Arc<std::sync::atomic::AtomicU64>,
+    stop_all_gate: Arc<Mutex<()>>,
 }
 
 impl DeviceManager {
@@ -32,6 +45,10 @@ impl DeviceManager {
             sessions: Default::default(),
             start_locks: Default::default(),
             scan_gate: Arc::new(Mutex::new(())),
+            mdns_last_probe: Default::default(),
+            stopping_all: Arc::new(AtomicBool::new(false)),
+            start_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            stop_all_gate: Arc::new(Mutex::new(())),
         }
     }
 
@@ -71,19 +88,48 @@ impl DeviceManager {
         }
     }
     pub async fn sessions(&self) -> Vec<(String, Arc<ScrcpySession>)> {
-        self.sessions
-            .read()
-            .await
-            .iter()
-            .filter(|(_, session)| session.is_alive())
-            .map(|(serial, session)| (serial.clone(), session.clone()))
-            .collect()
+        let (alive, stale) = {
+            let sessions = self.sessions.read().await;
+            sessions.iter().fold(
+                (Vec::new(), Vec::new()),
+                |(mut alive, mut stale), (serial, session)| {
+                    if session.is_alive() {
+                        alive.push((serial.clone(), session.clone()));
+                    } else {
+                        stale.push((serial.clone(), session.clone()));
+                    }
+                    (alive, stale)
+                },
+            )
+        };
+        if !stale.is_empty() {
+            let mut sessions = self.sessions.write().await;
+            let mut removed = Vec::new();
+            for (serial, session) in stale {
+                if sessions
+                    .get(&serial)
+                    .is_some_and(|current| Arc::ptr_eq(current, &session))
+                {
+                    removed.push(session);
+                    sessions.remove(&serial);
+                }
+            }
+            drop(sessions);
+            for session in removed {
+                let _ = session.shutdown().await;
+            }
+        }
+        alive
     }
     pub async fn start_session(
         &self,
         serial: String,
         options: SessionOptions,
     ) -> Result<Arc<ScrcpySession>> {
+        if self.stopping_all.load(Ordering::Acquire) {
+            anyhow::bail!("session manager is stopping all sessions")
+        }
+        let start_epoch = self.start_epoch.load(Ordering::Acquire);
         let lock = self
             .start_locks
             .lock()
@@ -92,6 +138,13 @@ impl DeviceManager {
             .or_default()
             .clone();
         let _guard = lock.lock().await;
+        if self.stopping_all.load(Ordering::Acquire)
+            || self.start_epoch.load(Ordering::Acquire) != start_epoch
+        {
+            drop(_guard);
+            self.prune_start_lock(&serial, &lock);
+            anyhow::bail!("session manager is stopping all sessions")
+        }
         if let Some(existing) = self.session(&serial).await {
             drop(_guard);
             self.prune_start_lock(&serial, &lock);
@@ -106,25 +159,51 @@ impl DeviceManager {
                 return Err(error);
             }
         });
-        self.sessions.write().await.insert(serial, session.clone());
+        let mut sessions = self.sessions.write().await;
+        if self.stopping_all.load(Ordering::Acquire)
+            || self.start_epoch.load(Ordering::Acquire) != start_epoch
+        {
+            drop(sessions);
+            let _ = session.shutdown().await;
+            drop(_guard);
+            self.prune_start_lock(&serial, &lock);
+            anyhow::bail!("session manager is stopping all sessions")
+        }
+        sessions.insert(serial, session.clone());
+        drop(sessions);
         drop(_guard);
         self.prune_start_lock(&session.serial, &lock);
         Ok(session)
     }
     pub async fn stop_session(&self, serial: &str) -> bool {
+        // Serialize stop with a concurrent start for the same serial. Without
+        // this guard, a start finishing just after the map removal could put a
+        // fresh session back into the manager after the stop request returns.
+        let lock = self
+            .start_locks
+            .lock()
+            .unwrap()
+            .entry(serial.to_owned())
+            .or_default()
+            .clone();
+        let _guard = lock.lock().await;
         let session = self.sessions.write().await.remove(serial);
         if let Some(session) = session {
             let _ = session.shutdown().await;
-            let lock = self.start_locks.lock().unwrap().get(serial).cloned();
-            if let Some(lock) = lock {
-                self.prune_start_lock(serial, &lock);
-            }
+            drop(_guard);
+            self.prune_start_lock(serial, &lock);
             true
         } else {
+            drop(_guard);
+            self.prune_start_lock(serial, &lock);
             false
         }
     }
     pub async fn stop_all_sessions(&self) {
+        let _stop_all_guard = self.stop_all_gate.lock().await;
+        self.start_epoch.fetch_add(1, Ordering::AcqRel);
+        self.stopping_all.store(true, Ordering::Release);
+        let _reset = StopAllFlag(self.stopping_all.clone());
         let sessions = self
             .sessions
             .write()
@@ -132,9 +211,22 @@ impl DeviceManager {
             .drain()
             .map(|(_, session)| session)
             .collect::<Vec<_>>();
+        let concurrency = std::env::var("SCRCPYFORGE_SESSION_STOP_CONCURRENCY")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+            .clamp(1, 16);
+        let permits = Arc::new(Semaphore::new(concurrency));
+        let mut tasks = tokio::task::JoinSet::new();
         for session in sessions {
-            let _ = session.shutdown().await;
+            let permit = permits.clone().acquire_owned().await;
+            let Ok(permit) = permit else { break };
+            tasks.spawn(async move {
+                let _permit = permit;
+                let _ = session.shutdown().await;
+            });
         }
+        while tasks.join_next().await.is_some() {}
         let locks = self
             .start_locks
             .lock()
@@ -150,19 +242,45 @@ impl DeviceManager {
     pub async fn scan(&self, connect_mdns: bool) -> Result<Vec<DeviceInfo>> {
         let _scan_guard = self.scan_gate.lock().await;
         let mut devices = self.adb.devices().await?;
-        if connect_mdns
-            && !devices
-                .iter()
-                .any(|device| device.wireless && matches!(device.state, crate::DeviceState::Device))
-        {
-            for endpoint in self.adb.mdns_endpoints().await.unwrap_or_default() {
-                let _ = self.adb.connect(&endpoint).await;
+        let probe_mdns = connect_mdns
+            && self
+                .mdns_last_probe
+                .lock()
+                .unwrap()
+                .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(10));
+        if probe_mdns {
+            *self.mdns_last_probe.lock().unwrap() = Some(std::time::Instant::now());
+            let endpoints = self
+                .adb
+                .mdns_endpoints()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .take(32)
+                .collect::<Vec<_>>();
+            let permits = Arc::new(Semaphore::new(4));
+            let mut tasks = tokio::task::JoinSet::new();
+            for endpoint in endpoints {
+                let permit = permits.clone().acquire_owned().await;
+                let Ok(permit) = permit else { break };
+                let adb = self.adb.clone();
+                tasks.spawn(async move {
+                    let _permit = permit;
+                    let _ = adb.connect(&endpoint).await;
+                });
             }
+            while tasks.join_next().await.is_some() {}
             devices = self.adb.devices().await?;
         }
         // adb 自身的 mDNS 自动连接可能把同一台设备的 IPv4 和多个 IPv6
         // 地址都登记为 serial。UI 和 per-device 脚本只保留一个稳定入口。
-        devices.sort_by_key(|device| (!device.wireless, device.serial.starts_with('[')));
+        devices.sort_by(|left, right| {
+            (!left.wireless, left.serial.starts_with('['), &left.serial).cmp(&(
+                !right.wireless,
+                right.serial.starts_with('['),
+                &right.serial,
+            ))
+        });
         let mut seen_wireless = std::collections::HashSet::new();
         devices.retain(|device| {
             if !device.wireless || !matches!(device.state, crate::DeviceState::Device) {
@@ -221,10 +339,20 @@ impl DeviceManager {
             tokio::time::sleep(std::time::Duration::from_millis(250)).await;
         }
 
-        for connect_endpoint in self.adb.mdns_endpoints().await.unwrap_or_default() {
-            if endpoint_host(&connect_endpoint) == host
-                && self.adb.connect(&connect_endpoint).await.is_ok()
-            {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        for connect_endpoint in self
+            .adb
+            .mdns_endpoints()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|endpoint| endpoint_host(endpoint) == host)
+            .take(32)
+        {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            if self.adb.connect(&connect_endpoint).await.is_ok() {
                 break;
             }
         }
@@ -246,6 +374,14 @@ impl DeviceManager {
             // while it can still serialize a new session.
             locks.remove(serial);
         }
+    }
+}
+
+struct StopAllFlag(Arc<AtomicBool>);
+
+impl Drop for StopAllFlag {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
     }
 }
 

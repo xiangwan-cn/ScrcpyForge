@@ -27,6 +27,7 @@ async fn main() -> anyhow::Result<()> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(15))
+        .default_headers(auth_headers())
         .build()?;
     let value: Option<serde_json::Value> = match args.command {
         Command::Health => Some(
@@ -83,6 +84,16 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::to_string_pretty(&value)?);
     }
     Ok(())
+}
+
+fn auth_headers() -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if let Some(token) = std::env::var_os("SCRCPYFORGE_AUTH_TOKEN") {
+        if let Ok(value) = format!("Bearer {}", token.to_string_lossy()).parse() {
+            headers.insert(reqwest::header::AUTHORIZATION, value);
+        }
+    }
+    headers
 }
 
 fn encode_path_segment(value: &str) -> String {

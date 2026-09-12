@@ -35,8 +35,11 @@ fn main() {
     println!("cargo:rustc-link-search=native={}", lib.display());
     println!("cargo:rustc-link-lib=dylib=opencv_core");
     println!("cargo:rustc-link-lib=dylib=opencv_imgproc");
-    if local.exists() {
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
+    if local.exists() && cfg!(target_os = "linux") {
+        // Keep release artifacts relocatable. `tools/run-forge-daemon` still
+        // sets LD_LIBRARY_PATH for development, while packaged binaries look
+        // beside the application for the bundled OpenCV libraries.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,$ORIGIN/../../third_party/opencv-root/usr/lib");
     }
     println!("cargo:rerun-if-changed=src/cv_bridge.cpp");
     println!("cargo:rerun-if-env-changed=OPENCV_INCLUDE_DIR");

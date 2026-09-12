@@ -8,11 +8,35 @@ use std::{
 };
 
 use anyhow::Result;
-use mlua::{Error as LuaError, HookTriggers, Lua, Table, VmState};
+use mlua::{Error as LuaError, HookTriggers, Lua, LuaOptions, StdLib, Table, VmState};
 use tokio::runtime::Handle;
 use uuid::Uuid;
 
 use crate::{adb::Adb, session::ScrcpySession, video::VideoFrame, ForgeEvent, InputAction};
+
+const MAX_TAP_RADIUS: u32 = 4096;
+const MAX_LOG_BYTES: usize = 64 * 1024;
+const MAX_TEMPLATES_PER_MATCH: usize = 64;
+const VISION_STATE_FILE: &str = ".scrcpyforge-vision-roi.state";
+const MAX_VISION_STATE_BYTES: u64 = 64 * 1024;
+
+/// Construct the Lua runtime with only the libraries required by automation.
+/// mlua's `ALL_SAFE` is safe for VM memory safety, but still exposes host I/O,
+/// process control and package loading. Scripts received through the daemon are
+/// untrusted input, so those capabilities must not exist in their globals.
+fn new_lua() -> mlua::Result<Lua> {
+    let lua = Lua::new_with(
+        StdLib::TABLE | StdLib::STRING | StdLib::MATH | StdLib::UTF8,
+        LuaOptions::default(),
+    )?;
+    let globals = lua.globals();
+    for name in [
+        "io", "os", "package", "debug", "ffi", "require", "dofile", "loadfile",
+    ] {
+        globals.set(name, mlua::Value::Nil)?;
+    }
+    Ok(lua)
+}
 
 pub struct LuaRun {
     pub id: Uuid,
@@ -22,6 +46,16 @@ pub struct LuaRun {
     processing: Arc<AtomicBool>,
     last_progress: Arc<std::sync::Mutex<Instant>>,
     error: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// Parse Lua source with the same restricted runtime used for execution. This
+/// is deliberately syntax-only: globals and host calls are resolved only when
+/// a validated run is attached to a session.
+pub fn validate_source(source: &str) -> Result<()> {
+    let lua = new_lua()?;
+    lua.set_memory_limit(64 * 1024 * 1024)?;
+    lua.load(source).into_function()?;
+    Ok(())
 }
 impl LuaRun {
     pub fn cancel(&self) {
@@ -134,7 +168,7 @@ pub fn run_frames_for_generation(
             serial: serial.clone(),
         });
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
-            let lua = Lua::new();
+            let lua = new_lua()?;
             let deadline = Arc::new(std::sync::Mutex::new(None));
             install_limits(&lua, token.clone(), Some(deadline.clone()))?;
             let forge = lua.create_table()?;
@@ -147,7 +181,27 @@ pub fn run_frames_for_generation(
                     } else {
                         millis.clamp(50, 60_000)
                     };
-                    rescan_interval_out.store(interval, Ordering::Release);
+                    // Multiple vision engines share one frame worker. Keep
+                    // the shortest requested wake-up so registering a second
+                    // engine can never make an existing static-screen rescan
+                    // less responsive.
+                    if interval != 0 {
+                        let mut current = rescan_interval_out.load(Ordering::Acquire);
+                        loop {
+                            if current != 0 && current <= interval {
+                                break;
+                            }
+                            match rescan_interval_out.compare_exchange_weak(
+                                current,
+                                interval,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            ) {
+                                Ok(_) => break,
+                                Err(next) => current = next,
+                            }
+                        }
+                    }
                     Ok(())
                 })?,
             )?;
@@ -163,12 +217,32 @@ pub fn run_frames_for_generation(
                 "monotonic_ms",
                 lua.create_function(move |_, ()| Ok(clock.elapsed().as_secs_f64() * 1000.0))?,
             )?;
+            let frame_root = script_dir.clone();
             add_script_paths(&lua, &forge, script_dir)?;
+            if frame_root.is_some() {
+                let load_root = frame_root.clone();
+                forge.set(
+                    "_vision_state_load",
+                    lua.create_function(move |_, ()| read_vision_state(&load_root))?,
+                )?;
+                let save_root = frame_root.clone();
+                forge.set(
+                    "_vision_state_save",
+                    lua.create_function(move |_, content: String| {
+                        write_vision_state(&save_root, &content)
+                    })?,
+                )?;
+            }
             forge.set(
                 "log",
                 lua.create_function({
                     let events = events.clone();
                     move |_, message: String| {
+                        if message.len() > MAX_LOG_BYTES {
+                            return Err(LuaError::RuntimeError(
+                                "log message must be at most 65536 bytes".into(),
+                            ));
+                        }
                         let _ = events.send(ForgeEvent::ScriptLog {
                             run_id: id,
                             message,
@@ -207,9 +281,8 @@ pub fn run_frames_for_generation(
                 .get("on_frame")
                 .map_err(|_| anyhow::anyhow!("Lua script must define on_frame(frame)"))?;
             let current = Arc::new(std::sync::RwLock::new(None));
-            let table = create_frame_table(&lua, current.clone())?;
+            let table = create_frame_table(&lua, current.clone(), frame_root)?;
             let mut first = true;
-            let mut last_processed_seq = None;
             let mut last_frame: Option<Arc<VideoFrame>> = None;
             loop {
                 // A static screen normally produces no packet. Wait for a new
@@ -254,12 +327,6 @@ pub fn run_frames_for_generation(
                     continue;
                 };
                 let rescan = !fresh_frame;
-                if !rescan && frame.frame_seq != 0 && last_processed_seq == Some(frame.frame_seq) {
-                    continue;
-                }
-                if frame.frame_seq != 0 {
-                    last_processed_seq = Some(frame.frame_seq);
-                }
                 last_frame = Some(frame.clone());
                 *current.write().unwrap() = Some(frame.clone());
                 table.set("width", frame.width)?;
@@ -349,7 +416,115 @@ fn current_frame(value: &CurrentFrame) -> mlua::Result<Arc<VideoFrame>> {
         .clone()
         .ok_or_else(|| LuaError::RuntimeError("frame unavailable".into()))
 }
-fn create_frame_table(lua: &Lua, current: CurrentFrame) -> mlua::Result<Table> {
+
+fn frame_asset_path(root: &Option<PathBuf>, value: &str) -> mlua::Result<PathBuf> {
+    let Some(root) = root.as_ref() else {
+        return Err(LuaError::RuntimeError(
+            "frame file operations require a named script asset path".into(),
+        ));
+    };
+    let path = Path::new(value);
+    let resolved = if path.is_absolute() {
+        if !path.starts_with(root) {
+            return Err(LuaError::RuntimeError(
+                "absolute frame path must stay inside the script directory".into(),
+            ));
+        }
+        path.to_owned()
+    } else {
+        if path.as_os_str().is_empty()
+            || path
+                .components()
+                .any(|component| matches!(component, Component::ParentDir))
+        {
+            return Err(LuaError::RuntimeError(
+                "frame path must be relative to the script directory".into(),
+            ));
+        }
+        root.join(path)
+    };
+    if resolved
+        .components()
+        .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+    {
+        return Err(LuaError::RuntimeError(
+            "frame path must be relative to the script directory".into(),
+        ));
+    }
+    let root_canonical = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned());
+    if let Ok(metadata) = std::fs::symlink_metadata(&resolved) {
+        if metadata.file_type().is_symlink() {
+            return Err(LuaError::RuntimeError(
+                "symbolic-link frame paths are not allowed".into(),
+            ));
+        }
+    }
+    if resolved.exists() {
+        let canonical = std::fs::canonicalize(&resolved).map_err(LuaError::external)?;
+        if !canonical.starts_with(&root_canonical) {
+            return Err(LuaError::RuntimeError(
+                "frame path resolves outside the script directory".into(),
+            ));
+        }
+    } else if let Some(parent) = resolved.parent() {
+        let canonical_parent = std::fs::canonicalize(parent).map_err(LuaError::external)?;
+        if !canonical_parent.starts_with(&root_canonical) {
+            return Err(LuaError::RuntimeError(
+                "frame path resolves outside the script directory".into(),
+            ));
+        }
+    }
+    Ok(resolved)
+}
+
+fn vision_state_path(root: &Option<PathBuf>) -> mlua::Result<PathBuf> {
+    frame_asset_path(root, VISION_STATE_FILE)
+}
+
+fn read_vision_state(root: &Option<PathBuf>) -> mlua::Result<Option<String>> {
+    let path = vision_state_path(root)?;
+    let metadata = match std::fs::metadata(&path) {
+        Ok(value) => value,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(LuaError::external(error)),
+    };
+    if metadata.len() > MAX_VISION_STATE_BYTES {
+        return Err(LuaError::RuntimeError(
+            "vision state file exceeds 64 KiB".into(),
+        ));
+    }
+    std::fs::read_to_string(path)
+        .map(Some)
+        .map_err(LuaError::external)
+}
+
+fn write_vision_state(root: &Option<PathBuf>, content: &str) -> mlua::Result<()> {
+    if content.len() as u64 > MAX_VISION_STATE_BYTES {
+        return Err(LuaError::RuntimeError(
+            "vision state file exceeds 64 KiB".into(),
+        ));
+    }
+    let path = vision_state_path(root)?;
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("vision-state");
+    let temporary = path.with_file_name(format!(".{stem}.tmp-{}.state", Uuid::new_v4()));
+    if let Err(error) = std::fs::write(&temporary, content.as_bytes())
+        .and_then(|_| std::fs::File::open(&temporary).and_then(|file| file.sync_all()))
+        .and_then(|_| std::fs::rename(&temporary, &path))
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(LuaError::external(error));
+    }
+    Ok(())
+}
+
+fn create_frame_table(
+    lua: &Lua,
+    current: CurrentFrame,
+    script_dir: Option<PathBuf>,
+) -> mlua::Result<Table> {
     let table = lua.create_table()?;
     table.set(
         "pixel",
@@ -371,19 +546,45 @@ fn create_frame_table(lua: &Lua, current: CurrentFrame) -> mlua::Result<Table> {
         ("find_gray", 2),
         ("find_fast_gray", 3),
     ] {
-        table.set(name,lua.create_function({let c=current.clone();move|lua,(_,path,threshold,roi):(Table,String,Option<f32>,Option<Table>)|{let f=current_frame(&c)?;let roi=parse_roi(roi)?;let found=match mode{1=>crate::cv::find_fast(&f,Path::new(&path),threshold.unwrap_or(0.8),roi),2=>crate::cv::find_gray(&f,Path::new(&path),threshold.unwrap_or(0.8),roi,false),3=>crate::cv::find_gray(&f,Path::new(&path),threshold.unwrap_or(0.8),roi,true),_=>crate::cv::find(&f,Path::new(&path),threshold.unwrap_or(0.8),roi)}.map_err(LuaError::external)?;found.map(|m|match_table(lua,&m)).transpose()}})?)?;
+        let c = current.clone();
+        let root = script_dir.clone();
+        table.set(
+            name,
+            lua.create_function(
+                move |lua, (_, path, threshold, roi): (Table, String, Option<f32>, Option<Table>)| {
+                    let f = current_frame(&c)?;
+                    let path = frame_asset_path(&root, &path)?;
+                    let roi = parse_roi(roi)?;
+                    let threshold = threshold.unwrap_or(0.8);
+                    let found = match mode {
+                        1 => crate::cv::find_fast(&f, &path, threshold, roi),
+                        2 => crate::cv::find_gray(&f, &path, threshold, roi, false),
+                        3 => crate::cv::find_gray(&f, &path, threshold, roi, true),
+                        _ => crate::cv::find(&f, &path, threshold, roi),
+                    }
+                    .map_err(LuaError::external)?;
+                    found.map(|m| match_table(lua, &m)).transpose()
+                },
+            )?,
+        )?;
     }
     table.set(
         "find_first",
         lua.create_function({
             let c = current.clone();
+            let root = script_dir.clone();
             move |lua, (_, paths, threshold, roi): (Table, Table, Option<f32>, Option<Table>)| {
                 let f = current_frame(&c)?;
-                let paths = paths
-                    .sequence_values::<String>()
-                    .map(|v| v.map(PathBuf::from))
-                    .collect::<mlua::Result<Vec<_>>>()?;
-                match crate::cv::find_first(&f, &paths, threshold.unwrap_or(0.8), parse_roi(roi)?)
+                let mut values = Vec::new();
+                for value in paths.sequence_values::<String>() {
+                    if values.len() >= MAX_TEMPLATES_PER_MATCH {
+                        return Err(LuaError::RuntimeError(format!(
+                            "find_first accepts at most {MAX_TEMPLATES_PER_MATCH} templates"
+                        )));
+                    }
+                    values.push(frame_asset_path(&root, &value?)?);
+                }
+                match crate::cv::find_first(&f, &values, threshold.unwrap_or(0.8), parse_roi(roi)?)
                     .map_err(LuaError::external)?
                 {
                     Some((index, m)) => {
@@ -400,15 +601,21 @@ fn create_frame_table(lua: &Lua, current: CurrentFrame) -> mlua::Result<Table> {
         "find_candidates",
         lua.create_function({
             let c = current.clone();
+            let root = script_dir.clone();
             move |lua, (_, paths, threshold, roi): (Table, Table, Option<f32>, Option<Table>)| {
                 let f = current_frame(&c)?;
-                let paths = paths
-                    .sequence_values::<String>()
-                    .map(|value| value.map(PathBuf::from))
-                    .collect::<mlua::Result<Vec<_>>>()?;
+                let mut values = Vec::new();
+                for value in paths.sequence_values::<String>() {
+                    if values.len() >= MAX_TEMPLATES_PER_MATCH {
+                        return Err(LuaError::RuntimeError(format!(
+                            "find_candidates accepts at most {MAX_TEMPLATES_PER_MATCH} templates"
+                        )));
+                    }
+                    values.push(frame_asset_path(&root, &value?)?);
+                }
                 let found = crate::cv::find_candidates(
                     &f,
-                    &paths,
+                    &values,
                     threshold.unwrap_or(0.8),
                     parse_roi(roi)?,
                 )
@@ -430,17 +637,14 @@ fn create_frame_table(lua: &Lua, current: CurrentFrame) -> mlua::Result<Table> {
         "find_multiscale",
         lua.create_function({
             let c = current.clone();
+            let root = script_dir.clone();
             move |lua, (_, path, threshold, roi): (Table, String, Option<f32>, Option<Table>)| {
                 let f = current_frame(&c)?;
-                crate::cv::find_multiscale(
-                    &f,
-                    Path::new(&path),
-                    threshold.unwrap_or(0.8),
-                    parse_roi(roi)?,
-                )
-                .map_err(LuaError::external)?
-                .map(|m| match_table(lua, &m))
-                .transpose()
+                let path = frame_asset_path(&root, &path)?;
+                crate::cv::find_multiscale(&f, &path, threshold.unwrap_or(0.8), parse_roi(roi)?)
+                    .map_err(LuaError::external)?
+                    .map(|m| match_table(lua, &m))
+                    .transpose()
             }
         })?,
     )?;
@@ -448,15 +652,13 @@ fn create_frame_table(lua: &Lua, current: CurrentFrame) -> mlua::Result<Table> {
         "find_all",
         lua.create_function({
             let c = current.clone();
+            let root = script_dir.clone();
             move |lua, (_, path, threshold, roi): (Table, String, Option<f32>, Option<Table>)| {
                 let f = current_frame(&c)?;
-                let found = crate::cv::find_all(
-                    &f,
-                    Path::new(&path),
-                    threshold.unwrap_or(0.8),
-                    parse_roi(roi)?,
-                )
-                .map_err(LuaError::external)?;
+                let path = frame_asset_path(&root, &path)?;
+                let found =
+                    crate::cv::find_all(&f, &path, threshold.unwrap_or(0.8), parse_roi(roi)?)
+                        .map_err(LuaError::external)?;
                 let list = lua.create_table()?;
                 for (i, m) in found.iter().enumerate() {
                     list.set(i + 1, match_table(lua, m)?)?
@@ -469,22 +671,55 @@ fn create_frame_table(lua: &Lua, current: CurrentFrame) -> mlua::Result<Table> {
         "save",
         lua.create_function({
             let c = current.clone();
+            let root = script_dir.clone();
             move |_, (_, path): (Table, String)| {
                 let f = current_frame(&c)?;
-                crate::cv::save(&f, Path::new(&path)).map_err(LuaError::external)
+                let path = frame_asset_path(&root, &path)?;
+                save_frame_atomic(&f, &path, None).map_err(LuaError::external)
             }
         })?,
     )?;
     table.set(
         "crop",
-        lua.create_function(
+        lua.create_function({
+            let root = script_dir.clone();
             move |_, (_, path, x1, y1, x2, y2): (Table, String, u32, u32, u32, u32)| {
                 let f = current_frame(&current)?;
-                crate::cv::crop(&f, Path::new(&path), (x1, y1, x2, y2)).map_err(LuaError::external)
-            },
-        )?,
+                let path = frame_asset_path(&root, &path)?;
+                save_frame_atomic(&f, &path, Some((x1, y1, x2, y2))).map_err(LuaError::external)
+            }
+        })?,
     )?;
     Ok(table)
+}
+
+fn save_frame_atomic(
+    frame: &VideoFrame,
+    path: &Path,
+    crop: Option<(u32, u32, u32, u32)>,
+) -> anyhow::Result<()> {
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("frame");
+    let temporary = path.with_file_name(format!(".{stem}.tmp-{}.png", Uuid::new_v4()));
+    let result = match crop {
+        Some(region) => crate::cv::crop(frame, &temporary, region),
+        None => crate::cv::save(frame, &temporary),
+    };
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::File::open(&temporary).and_then(|file| file.sync_all()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn add_script_paths(lua: &Lua, forge: &Table, script_dir: Option<PathBuf>) -> mlua::Result<()> {
@@ -532,7 +767,7 @@ fn execute(
     events: tokio::sync::broadcast::Sender<ForgeEvent>,
     runtime: Handle,
 ) -> Result<()> {
-    let lua = Lua::new();
+    let lua = new_lua()?;
     install_limits(&lua, cancelled.clone(), None)?;
     let forge = lua.create_table()?;
     forge.set(
@@ -545,6 +780,11 @@ fn execute(
     forge.set(
         "log",
         lua.create_function(move |_, message: String| {
+            if message.len() > MAX_LOG_BYTES {
+                return Err(LuaError::RuntimeError(
+                    "log message must be at most 65536 bytes".into(),
+                ));
+            }
             let _ = events.send(ForgeEvent::ScriptLog { run_id, message });
             Ok(())
         })?,
@@ -574,7 +814,7 @@ fn install_limits(
                 .is_some_and(|limit| Instant::now() >= limit)
             {
                 return Err(LuaError::RuntimeError(
-                    "frame callback exceeded 5 second hard limit".into(),
+                    "cooperative frame callback deadline exceeded (5 seconds)".into(),
                 ));
             }
             Ok(VmState::Continue)
@@ -595,6 +835,11 @@ fn add_wait(lua: &Lua, forge: &Table, cancelled: Arc<AtomicBool>) -> mlua::Resul
     forge.set(
         "wait",
         lua.create_function(move |_, millis: u64| {
+            if millis > 300_000 {
+                return Err(LuaError::RuntimeError(
+                    "wait duration must be at most 300000 ms".into(),
+                ));
+            }
             let mut remaining = millis;
             while remaining > 0 {
                 ensure_running(&cancelled)?;
@@ -626,7 +871,13 @@ fn add_adb_calls(
         lua.create_function({
             let call = shared.clone();
             move |_, (x, y, radius): (i32, i32, Option<u32>)| {
-                let (x, y) = random_point(x, y, radius.unwrap_or(0));
+                let radius = radius.unwrap_or(0);
+                if radius > MAX_TAP_RADIUS {
+                    return Err(LuaError::RuntimeError(
+                        "tap radius must be at most 4096 pixels".into(),
+                    ));
+                }
+                let (x, y) = random_point(x, y, radius);
                 call(InputAction::Tap { x, y })
             }
         })?,
@@ -721,8 +972,13 @@ fn add_session_calls(
             let check = check.clone();
             move |_, points: Table| {
                 check()?;
-                let mut parsed = vec![];
+                let mut parsed = Vec::with_capacity(10);
                 for pair in points.sequence_values::<Table>() {
+                    if parsed.len() >= 10 {
+                        return Err(LuaError::RuntimeError(
+                            "multi_tap accepts at most 10 points".into(),
+                        ));
+                    }
                     let pair = pair?;
                     parsed.push((pair.get(1)?, pair.get(2)?))
                 }
@@ -760,7 +1016,11 @@ fn add_session_calls(
         lua.create_function({
             let s = session.clone();
             let r = runtime.clone();
-            move |_, value: String| r.block_on(s.text(&value)).map_err(LuaError::external)
+            let check = check.clone();
+            move |_, value: String| {
+                check()?;
+                r.block_on(s.text(&value)).map_err(LuaError::external)
+            }
         })?,
     )?;
     forge.set(
@@ -824,7 +1084,7 @@ mod tests {
 
     #[test]
     fn declarative_vision_batches_targets_and_dispatches_action() -> mlua::Result<()> {
-        let lua = Lua::new();
+        let lua = new_lua()?;
         let forge = lua.create_table()?;
         forge.set("monotonic_ms", lua.create_function(|_, ()| Ok(1000.0))?)?;
         forge.set(
@@ -878,8 +1138,218 @@ mod tests {
     }
 
     #[test]
+    fn declarative_vision_persists_nearby_position_and_never_falls_back() -> mlua::Result<()> {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        let lua = new_lua()?;
+        let forge = lua.create_table()?;
+        let clock = Arc::new(AtomicU64::new(0));
+        let clock_out = clock.clone();
+        forge.set(
+            "monotonic_ms",
+            lua.create_function(move |_, ()| Ok(clock_out.load(Ordering::Relaxed) as f64))?,
+        )?;
+        forge.set(
+            "recommended_interval_ms",
+            lua.create_function(|_, ()| Ok(16_u64))?,
+        )?;
+        let saved_state = Arc::new(Mutex::new(None::<String>));
+        let saved_state_out = saved_state.clone();
+        forge.set(
+            "_vision_state_save",
+            lua.create_function(move |_, value: String| {
+                *saved_state_out.lock().unwrap() = Some(value);
+                Ok(())
+            })?,
+        )?;
+        lua.globals().set("forge", forge)?;
+        lua.load(include_str!("lua_vision.lua")).exec()?;
+        lua.load(
+            r#"
+            forge.vision {
+                threshold = 0.9,
+                tracking = {
+                    enabled = true,
+                    stable_history = 3,
+                    stable_hits = 3,
+                    position_tolerance_px = 16,
+                    roi_width_multiplier = 2,
+                    roi_height_multiplier = 3,
+                },
+                targets = {
+                    {name = "one", template = "one.png", action = "none", rearm = "timer"},
+                },
+            }
+            "#,
+        )
+        .exec()?;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let rois = Arc::new(Mutex::new(Vec::<Option<[i32; 4]>>::new()));
+        let calls_out = calls.clone();
+        let rois_out = rois.clone();
+        let frame = lua.create_table()?;
+        frame.set(
+            "find_candidates",
+            lua.create_function(
+                move |lua,
+                      (_frame, paths, _threshold, roi): (
+                    Table,
+                    Table,
+                    Option<f32>,
+                    Option<Table>,
+                )| {
+                    let _path = paths.sequence_values::<String>().next().transpose()?;
+                    let roi_value = roi
+                        .as_ref()
+                        .map(|value| {
+                            Ok::<[i32; 4], mlua::Error>([
+                                value.get(1)?,
+                                value.get(2)?,
+                                value.get(3)?,
+                                value.get(4)?,
+                            ])
+                        })
+                        .transpose()?;
+                    rois_out.lock().unwrap().push(roi_value);
+                    let index = calls_out.fetch_add(1, Ordering::Relaxed);
+                    let result = lua.create_table()?;
+                    if index < 4 {
+                        let match_value = lua.create_table()?;
+                        match_value.set("index", 1)?;
+                        match_value.set("x", 100 + index as i32 * 4)?;
+                        match_value.set("y", 100)?;
+                        match_value.set("w", 20)?;
+                        match_value.set("h", 10)?;
+                        match_value.set("confidence", 0.99_f32)?;
+                        result.set(1, match_value)?;
+                    }
+                    Ok(result)
+                },
+            )?,
+        )?;
+        frame.set("width", 1000)?;
+        frame.set("height", 600)?;
+        let on_frame: mlua::Function = lua.globals().get("on_frame")?;
+        for sequence in 1..=6_u64 {
+            clock.store(sequence * 100, Ordering::Relaxed);
+            frame.set("frame_seq", sequence)?;
+            frame.set("rescan", false)?;
+            on_frame.call::<()>(frame.clone())?;
+        }
+
+        let scans = rois.lock().unwrap().clone();
+        assert_eq!(scans.len(), 6);
+        assert!(scans[0].is_none() && scans[1].is_none() && scans[2].is_none());
+        assert_eq!(scans[3], Some([84, 85, 124, 115]));
+        assert_eq!(scans[4], Some([84, 85, 124, 115]));
+        assert_eq!(scans[5], Some([84, 85, 124, 115]));
+        let state = saved_state.lock().unwrap().clone().unwrap();
+        assert!(state.starts_with("version=1\n"));
+        assert!(state.contains("one.png"));
+        assert!(state.contains("|84|85|124|115"));
+        Ok(())
+    }
+
+    #[test]
+    fn declarative_vision_action_delay_and_duplicate_frames() -> mlua::Result<()> {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        let lua = new_lua()?;
+        let forge = lua.create_table()?;
+        let clock = Arc::new(AtomicU64::new(0));
+        let clock_out = clock.clone();
+        forge.set(
+            "monotonic_ms",
+            lua.create_function(move |_, ()| Ok(clock_out.load(Ordering::Relaxed) as f64))?,
+        )?;
+        let taps = Arc::new(AtomicUsize::new(0));
+        let taps_out = taps.clone();
+        forge.set(
+            "tap",
+            lua.create_function(move |_, (_x, _y, _radius): (i32, i32, u32)| {
+                taps_out.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            })?,
+        )?;
+        lua.globals().set("forge", forge)?;
+        lua.load(include_str!("lua_vision.lua")).exec()?;
+        lua.load(
+            r#"
+            forge.vision {
+                action_delay_ms = 500,
+                action = {type = "tap", radius = 5},
+                tracking = {stable_hits = 3, stable_history = 3},
+                targets = {{name = "delayed", template = "delayed.png", rearm = "timer",
+                    cooldown_ms = 1000}},
+            }
+            "#,
+        )
+        .exec()?;
+
+        let frame = lua.create_table()?;
+        frame.set("width", 400)?;
+        frame.set("height", 300)?;
+        frame.set(
+            "find_candidates",
+            lua.create_function(|lua, (_frame, _paths, _threshold, _roi): (
+                Table,
+                Table,
+                Option<f32>,
+                Option<Table>,
+            )| {
+                let match_value = lua.create_table()?;
+                match_value.set("index", 1)?;
+                match_value.set("x", 100)?;
+                match_value.set("y", 80)?;
+                match_value.set("w", 20)?;
+                match_value.set("h", 10)?;
+                match_value.set("confidence", 0.99_f32)?;
+                let result = lua.create_table()?;
+                result.set(1, match_value)?;
+                Ok(result)
+            })?,
+        )?;
+        let on_frame: mlua::Function = lua.globals().get("on_frame")?;
+        for (time, sequence) in [(0_u64, 1_u64), (100, 1), (499, 1)] {
+            clock.store(time, Ordering::Relaxed);
+            frame.set("frame_seq", sequence)?;
+            on_frame.call::<()>(frame.clone())?;
+        }
+        assert_eq!(taps.load(Ordering::Relaxed), 0);
+        clock.store(500, Ordering::Relaxed);
+        frame.set("frame_seq", 1_u64)?;
+        on_frame.call::<()>(frame)?;
+        assert_eq!(taps.load(Ordering::Relaxed), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn declarative_vision_engine_count_is_bounded() -> mlua::Result<()> {
+        let lua = new_lua()?;
+        let forge = lua.create_table()?;
+        forge.set("monotonic_ms", lua.create_function(|_, ()| Ok(0.0))?)?;
+        lua.globals().set("forge", forge)?;
+        lua.load(include_str!("lua_vision.lua")).exec()?;
+        lua.load(
+            r#"
+            for _ = 1, 16 do
+                forge.vision {targets = {{template = "button.png"}}}
+            end
+            "#,
+        )
+        .exec()?;
+        assert!(lua
+            .load(r#"forge.vision {targets = {{template = "overflow.png"}}}"#)
+            .exec()
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
     fn asset_paths_are_portable_and_cannot_escape_script_directory() -> mlua::Result<()> {
-        let lua = Lua::new();
+        let lua = new_lua()?;
         let forge = lua.create_table()?;
         add_script_paths(&lua, &forge, Some(PathBuf::from("/scripts/demo")))?;
         lua.globals().set("forge", forge)?;
@@ -896,11 +1366,21 @@ mod tests {
 
     #[test]
     fn instruction_hook_interrupts_cancelled_infinite_loop() -> mlua::Result<()> {
-        let lua = Lua::new();
+        let lua = new_lua()?;
         let cancelled = Arc::new(AtomicBool::new(false));
         install_limits(&lua, cancelled.clone(), None)?;
         cancelled.store(true, Ordering::Relaxed);
         assert!(lua.load("while true do end").exec().is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_does_not_expose_host_capability_libraries() -> mlua::Result<()> {
+        let lua = new_lua()?;
+        for name in ["io", "os", "package", "require", "dofile", "loadfile"] {
+            let kind: String = lua.load(format!("return type({name})")).eval()?;
+            assert_eq!(kind, "nil", "{name} must not be available");
+        }
         Ok(())
     }
 }
