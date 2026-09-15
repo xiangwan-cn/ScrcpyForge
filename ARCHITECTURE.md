@@ -75,8 +75,9 @@ can convert only an even-aligned ROI. Candidates return one best result per
 template, so the policy layer can compare targets without priority-order early
 return. Declarative vision has two search paths: full-frame matching until
 three nearby-position hits establish a persistent ROI, then matching only
-inside that ROI. The saved ROI is twice the template width by three times its
-height; misses do not expand it or fall back to a full-screen search.
+inside that ROI. The saved ROI is device-scoped, twice the template width by
+three times its height; misses do not expand it or fall back to a full-screen
+search. Devices using the same script keep separate state files.
 
 Frame-driven scripts define `on_frame(frame)`. Delivery is a single replaceable
 slot: while a callback runs, older pending frames are discarded and the next

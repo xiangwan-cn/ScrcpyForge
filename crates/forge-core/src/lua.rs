@@ -17,7 +17,8 @@ use crate::{adb::Adb, session::ScrcpySession, video::VideoFrame, ForgeEvent, Inp
 const MAX_TAP_RADIUS: u32 = 4096;
 const MAX_LOG_BYTES: usize = 64 * 1024;
 const MAX_TEMPLATES_PER_MATCH: usize = 64;
-const VISION_STATE_FILE: &str = ".scrcpyforge-vision-roi.state";
+const VISION_STATE_FILE_PREFIX: &str = ".scrcpyforge-vision-roi";
+const VISION_STATE_FILE_SUFFIX: &str = ".state";
 const MAX_VISION_STATE_BYTES: u64 = 64 * 1024;
 
 /// Construct the Lua runtime with only the libraries required by automation.
@@ -221,15 +222,17 @@ pub fn run_frames_for_generation(
             add_script_paths(&lua, &forge, script_dir)?;
             if frame_root.is_some() {
                 let load_root = frame_root.clone();
+                let load_serial = serial.clone();
                 forge.set(
                     "_vision_state_load",
-                    lua.create_function(move |_, ()| read_vision_state(&load_root))?,
+                    lua.create_function(move |_, ()| read_vision_state(&load_root, &load_serial))?,
                 )?;
                 let save_root = frame_root.clone();
+                let save_serial = serial.clone();
                 forge.set(
                     "_vision_state_save",
                     lua.create_function(move |_, content: String| {
-                        write_vision_state(&save_root, &content)
+                        write_vision_state(&save_root, &save_serial, &content)
                     })?,
                 )?;
             }
@@ -477,12 +480,29 @@ fn frame_asset_path(root: &Option<PathBuf>, value: &str) -> mlua::Result<PathBuf
     Ok(resolved)
 }
 
-fn vision_state_path(root: &Option<PathBuf>) -> mlua::Result<PathBuf> {
-    frame_asset_path(root, VISION_STATE_FILE)
+fn vision_state_file_name(serial: &str) -> String {
+    // Keep the device component deterministic and filesystem-safe. The short
+    // readable prefix helps identify files during troubleshooting, while the
+    // hash keeps the name bounded even if a transport supplies a long serial.
+    let mut hash = 0xcbf29ce484222325_u64;
+    let mut prefix = String::new();
+    for byte in serial.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+        if prefix.len() < 48 {
+            use std::fmt::Write;
+            let _ = write!(prefix, "{byte:02x}");
+        }
+    }
+    format!("{VISION_STATE_FILE_PREFIX}.{prefix}-{hash:016x}{VISION_STATE_FILE_SUFFIX}")
 }
 
-fn read_vision_state(root: &Option<PathBuf>) -> mlua::Result<Option<String>> {
-    let path = vision_state_path(root)?;
+fn vision_state_path(root: &Option<PathBuf>, serial: &str) -> mlua::Result<PathBuf> {
+    frame_asset_path(root, &vision_state_file_name(serial))
+}
+
+fn read_vision_state(root: &Option<PathBuf>, serial: &str) -> mlua::Result<Option<String>> {
+    let path = vision_state_path(root, serial)?;
     let metadata = match std::fs::metadata(&path) {
         Ok(value) => value,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -498,13 +518,13 @@ fn read_vision_state(root: &Option<PathBuf>) -> mlua::Result<Option<String>> {
         .map_err(LuaError::external)
 }
 
-fn write_vision_state(root: &Option<PathBuf>, content: &str) -> mlua::Result<()> {
+fn write_vision_state(root: &Option<PathBuf>, serial: &str, content: &str) -> mlua::Result<()> {
     if content.len() as u64 > MAX_VISION_STATE_BYTES {
         return Err(LuaError::RuntimeError(
             "vision state file exceeds 64 KiB".into(),
         ));
     }
-    let path = vision_state_path(root)?;
+    let path = vision_state_path(root, serial)?;
     let stem = path
         .file_stem()
         .and_then(|value| value.to_str())
@@ -1361,6 +1381,44 @@ mod tests {
             .load(r#"return forge.asset("../secret")"#)
             .eval::<String>()
             .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn vision_state_files_are_scoped_to_device() -> mlua::Result<()> {
+        let root_path =
+            std::env::temp_dir().join(format!("scrcpyforge-vision-state-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&root_path).map_err(LuaError::external)?;
+        let root = Some(root_path.clone());
+        let first_device = "192.168.1.180:38707";
+        let second_device = "192.168.1.181:38707";
+        let first_content = "version=1\nfirst\n";
+        let second_content = "version=1\nsecond\n";
+
+        write_vision_state(&root, first_device, first_content)?;
+        write_vision_state(&root, second_device, second_content)?;
+
+        assert_eq!(
+            read_vision_state(&root, first_device)?.as_deref(),
+            Some(first_content)
+        );
+        assert_eq!(
+            read_vision_state(&root, second_device)?.as_deref(),
+            Some(second_content)
+        );
+        let first_path = vision_state_path(&root, first_device)?;
+        let second_path = vision_state_path(&root, second_device)?;
+        assert_ne!(first_path, second_path);
+        assert!(first_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.ends_with(".state")));
+        assert!(second_path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| value.ends_with(".state")));
+
+        std::fs::remove_dir_all(root_path).map_err(LuaError::external)?;
         Ok(())
     }
 

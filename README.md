@@ -126,12 +126,12 @@ them. Static screens do not wake the frame callback unless a script explicitly
 sets a rescan interval.
 
 Declarative vision scripts scan the full frame on every callback until a target
-has three nearby-position hits. They then save a ROI sized at twice the
-template width and three times its height in
-.scrcpyforge-vision-roi.state beside the named script and use only that ROI.
-Each named script directory has its own state file, so moving the script
-directory moves its learned ROI with it. Misses never expand the ROI or fall
-back to a full scan; delete the state file to relearn. Cooldown is disabled by default; when configured, only a
+has three nearby-position hits. They then save a device-scoped ROI sized at
+twice the template width and three times its height under the named script
+directory and use only that ROI. Each device gets a separate state file, so
+devices cannot reuse one another's learned positions and moving the script
+directory moves the learned state with it. Misses never expand the ROI or fall
+back to a full scan; delete the corresponding device state file to relearn. Cooldown is disabled by default; when configured, only a
 successful action starts it.
 A script may opt into periodic checks of a
 static latest frame without building a historical frame queue.

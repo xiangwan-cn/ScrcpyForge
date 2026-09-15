@@ -5,9 +5,10 @@
 --   * scan_persistent_roi: matching in the saved 2x3-template ROI.
 --
 -- A target enters the ROI path after three consecutive matches whose centers
--- are close enough to one another. The ROI is written next to the named
--- script, so a script restart can reuse it. A miss never widens the ROI back
--- to a full-frame search; deleting the state file is the explicit reset.
+-- are close enough to one another. The host writes the state next to the
+-- named script in a device-scoped file, so a script restart can reuse the
+-- correct device's ROI. A miss never widens the ROI back to a full-frame
+-- search; deleting that device's state file is the explicit reset.
 local engines = {}
 local MAX_ENGINES = 16
 
